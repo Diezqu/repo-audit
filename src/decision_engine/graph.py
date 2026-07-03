@@ -73,7 +73,10 @@ def planner(state: State) -> dict:
     if tier is None:  # 假数据模式
         q = state["question"]
         return {"subtasks": [f"「{q}」的口碑与缺陷？", f"「{q}」有哪些替代品？"]}
-    llm = tier.client(temperature=0).with_structured_output(_Plan)
+    # method="function_calling"：DeepSeek 不支持 OpenAI 新的 json_schema
+    # response_format（400: This response_format type is unavailable now），
+    # 用工具调用协议拿结构化输出，两家都兼容。
+    llm = tier.client(temperature=0).with_structured_output(_Plan, method="function_calling")
     plan = llm.invoke(PLANNER_PROMPT.format(question=state["question"]))
     return {"subtasks": plan.subtasks}
 
@@ -114,7 +117,7 @@ def worker(task: WorkerInput) -> dict:
                 )
             ]
         }
-    llm = tier.client(temperature=0).with_structured_output(_Findings)
+    llm = tier.client(temperature=0).with_structured_output(_Findings, method="function_calling")
     found = llm.invoke(WORKER_PROMPT.format(subtask=task["subtask"]))
     source = f"model://{tier.model}"  # M2 接入真实搜索前的诚实标注
     return {
