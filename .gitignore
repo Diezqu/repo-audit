@@ -1,0 +1,19 @@
+# env / secrets — real keys and the private vault NEVER enter this repo
+.env
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
