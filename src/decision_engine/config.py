@@ -49,3 +49,19 @@ def cheap_tier() -> ModelTier:
 
 def flagship_tier() -> ModelTier:
     return _tier("FLAGSHIP")
+
+
+def try_cheap_tier() -> ModelTier | None:
+    """有配置就给客户端，没配就给 None——上层节点据此退回假数据模式，
+    这样骨架和 CI 在没有任何密钥的环境里也能完整跑通。"""
+    try:
+        return cheap_tier()
+    except RuntimeError:
+        return None
+
+
+def try_flagship_tier() -> ModelTier | None:
+    try:
+        return flagship_tier()
+    except RuntimeError:
+        return None
