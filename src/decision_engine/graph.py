@@ -18,7 +18,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from pydantic import BaseModel, Field
 
-from decision_engine import config
+from decision_engine import config, sources
 
 
 # ──────────────────────────────────────────────────────────────
@@ -29,9 +29,10 @@ class Evidence(BaseModel):
     """一条证据。结构化而非纯文本：Verifier 要按来源计票、报告要带引用。"""
 
     claim: str        # 这条证据支持的结论
-    source_url: str   # 来源（M2 前为 model://，之后为真实 URL）
+    source_url: str   # 主来源（搜索可用时为真实 URL，降级时为 model://）
     excerpt: str      # 原文摘录（防转述失真；模型知识作答时为空）
     worker_id: str    # 哪个 Worker 带回来的
+    supporting_urls: list[str] = []   # 支持同一结论的全部来源——Verifier 计票的原料
 
 
 class State(TypedDict):
@@ -93,18 +94,45 @@ def fan_out(state: State) -> list[Send]:
     ]
 
 
+class _SourcedFinding(BaseModel):
+    claim: str = Field(description="一条与子问题直接相关的具体结论，一句话")
+    # list 而非单个 int：真实故障教的——模型想表达"多条结果都支持这条结论"时
+    # 会硬塞 '1,2,3' 这种字符串进 int 字段；而"多来源支持"正是 Verifier 要计票的信号
+    source_indices: list[int] = Field(description="支持该结论的搜索结果编号（从 1 开始，可多个）")
+
+
+class _SourcedFindings(BaseModel):
+    findings: list[_SourcedFinding] = Field(
+        description="0-5 条结论；搜索结果与子问题无关时返回空列表，不许硬凑"
+    )
+
+
+WORKER_SEARCH_PROMPT = """你是调研员。下面是针对一个子问题的网页搜索结果，\
+从中提取 2-5 条与子问题直接相关的结论。规则：
+- 每条结论必须注明来自第几条搜索结果（source_index）
+- 只提取搜索结果实际支持的内容，不要掺入你自己的知识
+- 搜索结果与子问题无关时返回空列表，不许硬凑
+- 警惕营销口吻（只有优点、话术模板）——此类内容如需提取，结论里注明"疑似推广"
+
+子问题：{subtask}
+
+搜索结果：
+{results}"""
+
+
 class _Findings(BaseModel):
     findings: list[str] = Field(description="2-4 条独立、具体的调研结论，每条一句话")
 
 
-WORKER_PROMPT = """你是调研员。回答下面这个子问题，给出 2-4 条独立、具体的结论。\
+WORKER_FALLBACK_PROMPT = """你是调研员。回答下面这个子问题，给出 2-4 条独立、具体的结论。\
 只说你有把握的事实；没把握的就明确说"不确定"，不要编造。
 
 子问题：{subtask}"""
 
 
 def worker(task: WorkerInput) -> dict:
-    """领一个子问题，带证据回来（便宜档：跑量的活）。"""
+    """领一个子问题：先搜真实网页提取带来源的结论；搜索不可用时
+    降级为模型知识作答并如实标注（便宜档：跑量的活）。"""
     tier = config.try_cheap_tier()
     if tier is None:  # 假数据模式
         return {
@@ -117,9 +145,42 @@ def worker(task: WorkerInput) -> dict:
                 )
             ]
         }
+
+    src_name, results = sources.search_with_fallback(task["subtask"])
+
+    if results:  # 主路径：从真实搜索结果提取，证据带真 URL
+        numbered = "\n".join(
+            f"[{i}] {r.title}\n    {r.url}\n    {r.snippet[:300]}"
+            for i, r in enumerate(results, 1)
+        )
+        llm = tier.client(temperature=0).with_structured_output(
+            _SourcedFindings, method="function_calling"
+        )
+        found = llm.invoke(
+            WORKER_SEARCH_PROMPT.format(subtask=task["subtask"], results=numbered)
+        )
+        evidence = []
+        for f in found.findings:
+            valid = [i for i in f.source_indices if 1 <= i <= len(results)]
+            if not valid:
+                continue  # 全是不存在的编号：宁可丢弃也不挂错来源
+            primary = results[valid[0] - 1]
+            evidence.append(
+                Evidence(
+                    claim=f.claim,
+                    source_url=primary.url,
+                    excerpt=primary.snippet[:200],
+                    worker_id=task["worker_id"],
+                    supporting_urls=[results[i - 1].url for i in valid],
+                )
+            )
+        if evidence:
+            return {"evidence": evidence}
+
+    # 降级路径：搜索不可用/无结果——模型知识作答，来源如实标 model://
     llm = tier.client(temperature=0).with_structured_output(_Findings, method="function_calling")
-    found = llm.invoke(WORKER_PROMPT.format(subtask=task["subtask"]))
-    source = f"model://{tier.model}"  # M2 接入真实搜索前的诚实标注
+    found = llm.invoke(WORKER_FALLBACK_PROMPT.format(subtask=task["subtask"]))
+    source = f"model://{tier.model}"
     return {
         "evidence": [
             Evidence(claim=c, source_url=source, excerpt="", worker_id=task["worker_id"])
