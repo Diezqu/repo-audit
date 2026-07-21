@@ -3,7 +3,7 @@
 两层 fixture 缺一不可：
   - tmp_path 造的最小合成仓库——用来精确断言行号/截断阈值/护栏这些
     "差一位就是假引用"的细节，需要完全可控的输入；
-  - 本仓库自身(decision-engine/repo-audit)——用来证明工具在一个真实、
+  - 本仓库自身(repo-audit)——用来证明工具在一个真实、
     混杂(有 .git/.venv/多种文件类型)的仓库上跑得通，不是只在玩具数据上
     工作。任务要求"用本仓库自身当 fixture"，就是奔着这层去的。
 
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from decision_engine.repo_tools import (
+from repo_audit.repo_tools import (
     PathEscapeError,
     grep_repo,
     read_file,

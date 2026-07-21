@@ -18,7 +18,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from pydantic import BaseModel, Field
 
-from decision_engine import config, sources
+from repo_audit import config, sources
 
 
 # ──────────────────────────────────────────────────────────────
@@ -235,7 +235,7 @@ def build_graph():
 
 
 if __name__ == "__main__":
-    # 用法：python -m decision_engine.graph "该不该买 XXX"
+    # 用法：python -m repo_audit.graph "该不该买 XXX"
     question = " ".join(sys.argv[1:]) or "该不该买 Kragg 软质一脚蹬"
     result = build_graph().invoke({"question": question})
     print(result["report"])

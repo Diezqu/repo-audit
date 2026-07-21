@@ -2,12 +2,12 @@
 
 import pytest
 
-import decision_engine
-from decision_engine import config
+import repo_audit
+from repo_audit import config
 
 
 def test_version():
-    assert decision_engine.__version__
+    assert repo_audit.__version__
 
 
 def test_missing_env_raises(monkeypatch):

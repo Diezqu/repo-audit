@@ -1,6 +1,6 @@
 """端到端骨架测试：假数据模式，无网络、无密钥。"""
 
-from decision_engine.graph import build_graph
+from repo_audit.graph import build_graph
 
 
 def _clear_keys(monkeypatch):
@@ -24,7 +24,7 @@ def test_e2e_fake_mode(monkeypatch):
 def test_fanout_scales_with_subtasks(monkeypatch):
     """Send 扇出数量 = 子问题数量（而非写死的节点数）。"""
     _clear_keys(monkeypatch)
-    from decision_engine.graph import fan_out
+    from repo_audit.graph import fan_out
 
     sends = fan_out({"question": "q", "subtasks": ["a", "b", "c", "d"], "evidence": [], "report": ""})
     assert len(sends) == 4

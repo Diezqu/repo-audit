@@ -1,7 +1,7 @@
 [project]
-name = "decision-engine"
+name = "repo-audit"
 version = "0.1.0"
-description = "Multi-agent decision research & verification engine: Planner → parallel Workers → adversarial Verifier → cited decision reports, with a private preference-memory source via a self-built MCP connector."
+description = "Multi-agent repository research & verification engine: Planner reads the repo map → parallel Workers gather evidence with local tools (tree/read/grep) → an independent Verifier re-checks each file:line citation → cited architecture docs and Q&A."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -28,7 +28,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/decision_engine"]
+packages = ["src/repo_audit"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
