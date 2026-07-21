@@ -55,7 +55,8 @@ Verifier（中档，可开关）：重新打开每条引用位置逐条判定
 - [x] LangGraph 骨架：Planner → 动态并行 Worker（Send）→ 合成器
 - [x] 双档模型路由 / 结构化证据 / pytest + CI
 - [x] 15 条架构决策记录 + 战伤日志（含一次完整止损：D10–D15 消费数据行业级死题 → 保引擎换领域）
-- [ ] 仓库工具层（tree / read_file / grep / repo_stats，路径白名单 + 输出截断）
+- [x] 仓库工具层（tree / read_file / grep / repo_stats，路径白名单 + 输出截断，见 D16）
+- [x] 证据源改造：RepoSource 接入本地仓库取证，替换博查/DDG 网搜实现（见 D16）
 - [ ] Verifier v1 + 开关
 - [ ] 30 题评测集（LangGraph + FastMCP，pin commit）+ 10 题人工金标 + judge + 回归 CI
 - [ ] Verifier 开/关 ablation 数字

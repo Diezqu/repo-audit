@@ -184,3 +184,21 @@
 **迁移账**：保留 = LangGraph 状态机、Send 并行、双档路由、结构化证据、CI、全部决策与战伤记录；更换 = sources.py 证据源、Planner/Worker 提示词；新增 = Verifier（本就是 M2 计划内）、评测集、MCP server 化。消费版的「MCP 私有偏好记忆」钩子退役，由「核验严谨、可量化压幻觉」+「MCP server 化」接棒。仓库改名 repo-audit。
 
 **面试一句话**：我在消费领域把数据链路做到第四层补救后，确认那是行业级死题，于是止损——保住九成与领域无关的引擎资产，把 Worker 的世界从「脏的开放网页」换成「干净的本地仓库」，评测同步从人工偏好升级为可自动核对的硬指标；整个转向 D10 到 D15 全程留痕。
+
+---
+
+## D16 · 仓库工具四件套的护栏设计 + 证据源改造为 RepoSource（D15 落地，2026-07-21）
+
+**背景**：D15 定案后的第一块地基——Worker 取证要有工具可用（tree/read_file/grep/repo_stats），且 sources.py 要从网络搜索换成本地仓库取证。这里记录几个当场做出、没有回头找人确认的实现取舍。
+
+**取舍 1：路径护栏钉在哪一层**。备选：在 Worker/Planner 的 prompt 里"叮嘱"模型别越界（软约束）vs 在工具函数入口处强制校验（硬约束）。选硬约束——rel_path 本质上是模型的输出，可能是幻觉、也可能是仓库内容注入后的产物，唯一可靠的防线是"打开文件"这个动作本身，而不是指望模型自觉。实现上 `resolve()` 再 `is_relative_to(root)`，顺带处理了两类逃逸：字面 `../` 穿越，以及更隐蔽的**符号链接逃逸**（root 内部一个软链接指向 root 外部，字符串看着无害，`resolve()` 展开后一样会跳出 root）——后者专门写了一条单测，不是理论风险。
+
+**取舍 2：grep 截断的探针机制**。纯 Python 回退路径如果命中数恰好等于上限（比如限 3 条、真实也只有 3 条命中），"数量 == 上限"和"数量超上限被砍到上限"是两种不同的情况，但看输出长度分不出来——前者不该标"已截断"，后者必须标。做法是多抓一条作探针（拿 limit+1 条，超过 limit 才截并标注），单测里专门写了一条"恰好等于上限不应误报截断"来钉死这个边界，因为它是那种"实现时最容易顺手写错、写错了还不报错"的 bug。
+
+**取舍 3：rg 不可用时如何测"回退"**。这台开发机上没有真装 ripgrep 二进制（交互式 shell 里能跑的 `rg`其实是 Claude Code 自带的 shell 函数壳，会转发给 claude 自身，子进程 `subprocess`/`shutil.which` 都看不到它）——这个发现直接决定了测试策略：纯 Python 路径是本机真实会执行的代码，直接跑；rg 路径用 `monkeypatch` 伪造 `shutil.which` + `subprocess.run` 验证命令构造（`--glob`/`--max-count` 等参数）与输出解析，不依赖某台特定机器是否装了 rg；另外补一条 `skipif(shutil.which("rg") is None)` 的真实集成测试，装了 rg 的机器上会自动跑起来，没装的机器上干净跳过而不是伪造通过。三层加起来，"回退"这个词才算真正被测到，而不是只测了自己造的 mock。
+
+**取舍 4：RepoSource 复用 SearchResult 的字段形状，而不是新定义一个 Evidence 子类**。约束是"不改 Planner/Worker 提示词内容，graph.py 只做机械 import 同步"——这意味着 `worker()` 里读 `r.title/r.url/r.snippet` 拼 prompt 的代码一个字都不能动。让 RepoSource 产出的 `SearchResult` 复用完全相同的三个字段（title=相对路径，url=`file:line` 引用，snippet=命中行原文），`search_with_fallback()`/`available_sources()` 也保留原签名（只加一个有默认值的可选 `root` 参数）——graph.py 因此**零改动**（除 import 路径）就能力接入新证据源。代价是字段名字面上还挂着"搜索"的历史包袱（url 不再是网址），已在 sources.py 的类文档里显式讲清语义转译，不算债务，是接口稳定性换来的合理妥协。
+
+**留白说明**：`available_sources()` 的 `root` 参数目前默认 `Path.cwd()`——State 还没有 `repo_root` 字段（Planner/Worker 提示词仍是消费决策版，切换是另一条线的任务），这是过渡期的诚实占位，不是"做完了"，代码注释里留了给下一次接线的路标。
+
+**面试一句话**：护栏钉在工具入口而不是提示词里，因为 prompt 是软约束、`resolve()+is_relative_to` 才是真正挡得住幻觉路径和符号链接逃逸的硬约束；测 rg 回退时我先验证了这台机器根本没装真 rg，于是纯 Python 路径直接测真实行为、rg 路径用 mock 测命令构造，两条路径的正确性都不靠运气。
