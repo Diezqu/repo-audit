@@ -49,38 +49,56 @@ if not target.is_dir():
     print(f"目标路径不存在或不是目录：{target}")
     sys.exit(1)
 
+from langfuse import get_client  # noqa: E402
+from repo_audit import config  # noqa: E402
 from repo_audit.graph import build_graph  # noqa: E402 （依赖上面 load_dotenv 先执行）
 from repo_audit.repo_tools import PathEscapeError, read_file  # noqa: E402
 
-result = build_graph().invoke({"question": question, "repo_root": str(target)})
-claims = result["claims"]
-report = result["report"]
+# T8：Langfuse 观测埋点。无密钥时返回 None、不传 callbacks，行为与接入前
+# 完全一样（设计说明见 config.langfuse_handler）。
+handler = config.langfuse_handler()
+invoke_kwargs = {"config": {"callbacks": [handler]}} if handler is not None else {}
 
-print(f"目标仓库: {target}    问题: {question}")
-print(f"共 {len(claims)} 条 claim\n")
-print(report)
+try:
+    result = build_graph().invoke(
+        {"question": question, "repo_root": str(target)}, **invoke_kwargs
+    )
+    claims = result["claims"]
+    report = result["report"]
 
-verified = False
-for claim in claims:
-    if claim.status != "supported" or not claim.citations:
-        continue
-    for cite in claim.citations:
-        try:
-            text = read_file(target, cite.file, cite.line_start, cite.line_end)
-        except (FileNotFoundError, PathEscapeError, ValueError) as exc:
-            print(f"\n（引用回读失败，跳过：{cite.file}:{cite.line_start}-{cite.line_end} —— {exc}）")
+    print(f"目标仓库: {target}    问题: {question}")
+    print(f"共 {len(claims)} 条 claim\n")
+    print(report)
+
+    verified = False
+    for claim in claims:
+        if claim.status != "supported" or not claim.citations:
             continue
-        if text.strip() and "空范围" not in text:
-            verified = True
-            print(
-                f"\n独立复核通过：{cite.file}:L{cite.line_start}-{cite.line_end} 非空"
-                f"\n对应结论：{claim.statement}"
-            )
+        for cite in claim.citations:
+            try:
+                text = read_file(target, cite.file, cite.line_start, cite.line_end)
+            except (FileNotFoundError, PathEscapeError, ValueError) as exc:
+                print(f"\n（引用回读失败，跳过：{cite.file}:{cite.line_start}-{cite.line_end} —— {exc}）")
+                continue
+            if text.strip() and "空范围" not in text:
+                verified = True
+                print(
+                    f"\n独立复核通过：{cite.file}:L{cite.line_start}-{cite.line_end} 非空"
+                    f"\n对应结论：{claim.statement}"
+                )
+                break
+        if verified:
             break
-    if verified:
-        break
 
-if not verified:
-    print("\n烟测失败：没有任何一条 supported 结论的引用能被独立回读验证。")
-    sys.exit(1)
-print("\n烟测通过：D2 验收线达成。")
+    if not verified:
+        print("\n烟测失败：没有任何一条 supported 结论的引用能被独立回读验证。")
+        sys.exit(1)
+    print("\n烟测通过：D2 验收线达成。")
+finally:
+    # 短脚本进程退出前必须显式收尾，理由与 graph.py __main__ 那份注释相同：
+    # Langfuse 4.x 批量异步上报，不 flush 直接退出会丢 trace；放 finally
+    # 而不是紧跟在 invoke() 后面，是为了上面任何一步抛异常（包括"烟测失败"
+    # 那条 sys.exit(1)）时也能先把已产生的 trace 发出去再真正退出——失败
+    # 的这次调用恰恰是最需要看观测数据排查的一次。
+    if handler is not None:
+        get_client().shutdown()

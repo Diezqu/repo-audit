@@ -45,6 +45,7 @@ from typing import Annotated, TypedDict
 
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
+from langfuse import get_client
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 from pydantic import BaseModel, ConfigDict, Field
@@ -689,5 +690,28 @@ if __name__ == "__main__":
         if len(sys.argv) >= 3
         else "这个仓库的整体架构是怎样的？分几层，各层职责是什么？"
     )
-    result = build_graph().invoke({"question": question, "repo_root": repo_root})
-    print(result["report"])
+    # T8：Langfuse 观测埋点。无密钥时 langfuse_handler() 返回 None——不传
+    # callbacks，invoke() 与接入前完全一样，零副作用（设计说明见
+    # config.langfuse_handler）。有密钥时把 handler 通过 LangGraph 的
+    # RunnableConfig 传进去：LangGraph 会把这一个 callback 自动传播到图内
+    # 全部节点（含 fan_out 用 Send 动态派发出的每个并行 worker）产生的每一次
+    # LLM 调用上，不需要在 planner/worker/synthesizer 三个节点里各自手动埋点。
+    handler = config.langfuse_handler()
+    invoke_kwargs = {"config": {"callbacks": [handler]}} if handler is not None else {}
+    try:
+        result = build_graph().invoke(
+            {"question": question, "repo_root": repo_root}, **invoke_kwargs
+        )
+        print(result["report"])
+    finally:
+        # 短脚本进程退出前必须显式收尾：Langfuse 4.x 是批量异步上报，不
+        # flush 就让进程退出，缓冲区里还没发出去的 trace 会直接丢失。放在
+        # finally 而不是紧跟在 invoke() 后面，是为了 invoke() 本身抛异常时
+        # 也能把已经产生的 trace 发出去——报错的这次调用恰恰是最需要观测
+        # 数据排查的一次，不能因为进程要退出就先丢了它。用 shutdown() 而
+        # 不是 flush()：这是进程退出前的最后一步，shutdown() 在 flush 之后
+        # 顺带把后台上报线程也干净收掉，比只 flush 更贴合"马上要退出"这个
+        # 场景（get_client() 拿到的是 CallbackHandler 内部同一个单例，见
+        # langfuse.get_client 源码里的 LangfuseResourceManager 单例表）。
+        if handler is not None:
+            get_client().shutdown()
