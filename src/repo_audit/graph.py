@@ -27,15 +27,26 @@ docs/prompts-v2-draft.md，本文件只做"照图纸接线"，不重新发明设
    带 [n] 引用编号的调研报告，insufficient 的结论显式标"存疑：证据不足"，
    引用清单由代码而非 LLM 兜底渲染成 file:L起-L止——格式的正确性不指望
    LLM 抄对，这是 D3"证据是结构化对象、不是文本"同一个原则的延伸。
+4. Verifier（管道已接、判定规则待定，见下）：静态边接在 worker 与
+   synthesizer 之间，读 config.verifier_enabled()（VERIFIER_ENABLED 环境
+   变量，默认关）——关闭时原样透传 claims（今天的输出与还没有这一层完全
+   一致），打开时对每条 claim 调 _judge_claim 独立核验。
 
-无密钥时（config.try_*_tier() 返回 None）三个节点各自走确定性假数据分支，
-结构与真路径完全一致——D6"骨架无密钥可跑"的约定原样保留，只是假数据的
-形状换成了新的 SubTask/Claim。
+无密钥时（config.try_*_tier() 返回 None）上面三个模型节点（Planner/
+Worker/Synthesizer）各自走确定性假数据分支，结构与真路径完全一致——D6
+"骨架无密钥可跑"的约定原样保留，只是假数据的形状换成了新的 SubTask/
+Claim。Verifier 不在此列：它不读任何模型档，是否运行只取决于
+VERIFIER_ENABLED 这一个开关，与有没有密钥无关。
 
-Verifier（回读 file:line 独立核验 supported/refuted/insufficient）本版尚未
-接入，是明天 D3 的活；ClaimDraft.status 目前只有 supported/insufficient
-两值，字段设计已按草案 §2.2 留好给 Verifier 用的三值升级空间，不需要
-返工。
+Verifier 判定规则本版尚未定案（管道已接、规则待定）：回读 file:line 独立
+核验 supported/refuted/insufficient 是 Ziyang 接下来要亲手写的判断题本体，
+见分工红线 §3——今晚（D3 管道脚手架）只落地了这道判断题上游、无争议的一段：
+引用的 file:line 是否真实存在（存在性检查，见 _judge_claim）。存在性检查
+之后"这几行代码是否真的支持这句话"的语义判定，_judge_claim 显式抛出
+NotImplementedError，不是漏做、是红线本身。Claim.verdict 字段（与 Worker
+自述的 status 语义分工见 Claim 类注释）就是判定规则落地后要填的位置，
+None=尚未判定；报告渲染（_render_claims）已经按 verdict 优先、None 时
+退回现状按 status 渲染的规则升级好——接线全部就绪，只等规则本体。
 """
 
 import operator
@@ -85,8 +96,8 @@ class Plan(BaseModel):
 
 
 class Citation(BaseModel):
-    """一条引用坐标：不只是给人看的出处，是 Verifier（明天 D3）回读源码
-    独立核验的唯一依据（草案 §0.5）。"""
+    """一条引用坐标：不只是给人看的出处，是 Verifier 回读源码独立核验的
+    唯一依据（草案 §0.5；管道接线见 _judge_claim，判定规则待 D3 定案）。"""
 
     file: str          # 仓库相对路径，逐字取自工具输出，禁止臆造
     line_start: int    # 取自 read_file 的行号——没读过就没有行号可填
@@ -120,20 +131,54 @@ class Claim(ClaimDraft):
     追踪字段来自 Send 载荷，不是模型输出——用继承而不是重复声明三个字段，
     精确表达"Claim 是 ClaimDraft 加了追踪信息"这层关系，不是两个平行的
     独立结构（对照消费版 Evidence 在 _SourcedFinding 基础上加 worker_id
-    的同一个模式）。"""
+    的同一个模式）。
+
+    verdict（D3 新增）：Verifier 的独立核验结论。None=尚未核验——今晚：管道
+    已经接好，但 _judge_claim 的判定规则本体待 Ziyang 定案（见该函数
+    docstring）；规则落地后取值 supported/refuted/insufficient。
+
+    verdict 与 status 不是同一件事的两个名字，是两个不同评判者的话（草案
+    §2.4 问 3）：
+    - status 是 Worker 的自述——"我自认有引用支撑"，写这条结论的模型自己
+      填的，天然会偏袒自己，判不出自己"说错了"（refuted 这个值 Worker
+      根本给不出，只有两值 supported/insufficient）；
+    - verdict 是 Verifier 回读 file:line 之后的独立复核——"这几行代码是否
+      真的支持这句话"，评判者换成了没写过这条结论的第三方，才有资格判
+      refuted。
+    两者语义不同，不能合并成一个字段：报告渲染（_render_claims）以 verdict
+    优先——有核验结论就按核验结论说话，verdict 是 None（未核验）时才退回
+    现状按 status 渲染，这也是"Verifier 关闭时输出必须与今天完全一致"这条
+    验收标准在数据结构上的体现。
+    """
 
     worker_id: str
     target_module: str
+    verdict: str | None = None
 
 
 class State(TypedDict):
-    """共享状态。claims 声明为"并行追加"（operator.add）；
-    其余字段只有一个写入者，用默认的覆盖语义。"""
+    """共享状态。claims 声明为"并行追加"（operator.add）——Worker 的 Send
+    扇入需要这个语义，多个并行 Worker 各自回填一段 claims，靠它拼成完整
+    列表。
+
+    verified_claims 故意是普通覆盖字段（无 reducer，最后一次写入生效），
+    不是"claims 的另一份拷贝"这么简单——它是 verifier() 存在的直接原因：
+    claims 的 reducer 是 operator.add，绑在这个 channel 上，对它的每一次
+    写入都会触发（不分是不是来自 Send）；如果 verifier 也写 claims，
+    LangGraph 会把它的产出与已有 claims 相加（列表相加=拼接），变成"一份
+    没 verdict 的 + 一份有 verdict 的"两份重复结论，而不是替换。
+    verified_claims 用默认覆盖语义，一次性整体替换，才是 verifier 真正
+    需要的语义——claims 保留不动，含义收窄为"Worker 的原始产出，只服务
+    Send 扇入"，synthesizer 改读 verified_claims（见 verifier() docstring
+    的完整论证）。
+
+    其余字段只有一个写入者，同样用默认的覆盖语义。"""
 
     question: str
     repo_root: str
     subtasks: list[SubTask]
     claims: Annotated[list[Claim], operator.add]
+    verified_claims: list[Claim]
     report: str
 
 
@@ -590,6 +635,109 @@ def worker(task: WorkerInput) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
+# 节点：Verifier（D3：管道已接，判定规则本体待定案）
+# ──────────────────────────────────────────────────────────────
+
+def _judge_claim(root: Path, claim: Claim) -> str:
+    """规则接缝（D3 红线）：Verifier"什么算 supported、refuted/insufficient
+    的判定界线"是 Ziyang 本人的判断题，今晚绝不实现（见方案 D3、分工红线
+    §3）。今晚只落地这道判断题上游、无争议的一段——存在性检查：citation
+    指向的位置是否真实存在。这不是待决策的判断题，是纯粹的事实核验：引用
+    一个根本不存在的 file/行区间，不需要理解任何语义就能确定是编造的。
+
+    对 claim.citations 里的每一条，依次检查三件事，任何一步失败都直接可以
+    确定这条引用是假的、整条 claim 判 "refuted"（对照工具层 read_file 的
+    docstring："行号格式必须严格对齐...行号错一位，引用就是假的"——这里是
+    同一个原则在核验层的落地）：
+      1. file 在 root 内真实存在——复用 _resolve_within 同一份护栏（工具层
+         用它挡模型的路径穿越，这里用它挡"file 字段是模型编的，仓库里根本
+         没有这个路径"，两个消费方共用一份实现，不重新发明）；
+      2. line_start/line_end 落在文件真实行数范围内——这一步必须自己算
+         total_lines 再比较，不能靠 read_file 的返回值反推：read_file 对
+         越界的 start/end 是**静默 clamp**（lo=max(1,start)、
+         hi=min(total,end)），不是报错，如果只看 read_file 能不能读出内容,
+         一个声称"第 99999 行"、实际被 clamp 到文件末尾的假引用会被误判成
+         "读到内容了=真的"——所以行区间必须用真实 total_lines 单独校验；
+      3. 用 read_file 真读一次，内容非空——上面两条是"数字对不对"的静态
+         检查，这一步是"真的能读出东西来"的动态确认，复用与 Worker 完全
+         同一个 read_file，核验用的是 Worker 当初本该用的同一份唯一依据。
+
+    citations 为空时（典型情况：claim.status == "insufficient"，Worker 自己
+    都没声称有证据）上面的循环一次都不会进入，直接落到下面同一个
+    NotImplementedError——这不是本函数在替 Verifier 判"insufficient 该不该
+    有 verdict"，只是循环在空列表上的自然结果；调用方 verifier() 对这类
+    claim 会捕获同一个异常、verdict 保持 None，效果等价于"跳过"，但不是靠
+    这里的一条 if 提前拍板"这类结论不需要核验"。
+
+    存在性检查全部通过之后——即"引用的位置是真的"——再往下判"这几行代码的
+    内容是否真的支持 statement 这句话"（语义匹配）才是待决策的判断题本体，
+    今晚绝不实现，用抛异常代替沉默地瞎猜。
+    """
+    for c in claim.citations:
+        try:
+            path = _resolve_within(root, c.file)
+        except PathEscapeError:
+            return "refuted"  # file 字段是越界路径——不可能是真实引用
+        if not path.is_file():
+            return "refuted"  # 引用的位置在仓库里根本不存在
+        try:
+            total_lines = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError:
+            return "refuted"  # 读不出来（权限/损坏等）——无法确认引用真实存在，保守判假
+        if not (1 <= c.line_start <= c.line_end <= total_lines):
+            return "refuted"  # 行区间超出文件真实行数（或本身首尾颠倒），必然编造
+        content = _read_file(root, c.file, c.line_start, c.line_end)
+        if not content.strip():
+            return "refuted"  # 声称有内容，实际读出来是空的
+
+    raise NotImplementedError("判定规则待 Ziyang 五道决策题定案后落地——见方案 D3")
+
+
+def verifier(state: State) -> dict:
+    """核验层（D3 管道接线；判定规则本体见 _judge_claim）。静态边——接在
+    worker 与 synthesizer 之间，不需要 Send：worker 的 Send 扇入在这一步
+    之前已经完成（claims 已是聚合好的完整列表），verifier 只是对这份已知
+    长度的列表做一次遍历判定，没有"运行时才知道要派几个"的动态并行需求。
+
+    为什么产出写进新字段 verified_claims、而不是直接覆盖 claims：见 State
+    的 docstring——claims 的 reducer 是 operator.add，这里如果也返回
+    {"claims": ...}，会被拼接而不是替换，产生重复结论。verified_claims
+    无 reducer、整体覆盖，一次性替换，才是这里真正需要的语义。
+
+    开关（config.verifier_enabled()，默认关）：
+    - 关闭：原样透传，不新建对象——verified_claims 与 claims 逐字一致
+      （verdict 是 Claim 的默认值 None）。今天（开关默认关闭）的报告产出
+      必须与还没有这一层完全相同，这是验收标准，不是顺带的优化。
+    - 打开：对 claims 里每一条都调 _judge_claim(root, claim)，不按 status
+      提前筛掉 insufficient 的那些——"要不要理会一条自称没证据的结论"本身
+      已经贴着"什么算需要核验的结论"这道红线，今晚不替 Ziyang 拍板；
+      insufficient 的空 citations 列表在 _judge_claim 里自然是"零次循环、
+      无失败"，照样落到同一个 NotImplementedError，被下面同一个 except
+      捕获成 verdict=None——效果等价于"跳过"，但不是这里的一条 if 替它
+      判了"不需要核验"，是规则函数自己在空输入上的诚实结果。
+
+    _judge_claim 抛 NotImplementedError 是预期行为、不是 bug：今晚只落地了
+    存在性检查这一段判定规则，凡是存在性检查通过（或没有引用可查）、需要
+    继续往下判语义的 claim 都会走到这里——捕获后 verdict 置 None，保证
+    开关误打开也不会崩掉整个 run；报告渲染层（_render_claims）看到 verdict
+    is None 时会按现状用 status 渲染，行为上和"还没有 Verifier"完全一样
+    安全。
+    """
+    if not config.verifier_enabled():
+        return {"verified_claims": state["claims"]}
+
+    root = Path(state["repo_root"])
+    verified: list[Claim] = []
+    for claim in state["claims"]:
+        try:
+            verdict = _judge_claim(root, claim)
+        except NotImplementedError:
+            verdict = None
+        verified.append(claim.model_copy(update={"verdict": verdict}))
+    return {"verified_claims": verified}
+
+
+# ──────────────────────────────────────────────────────────────
 # 节点：Synthesizer
 # ──────────────────────────────────────────────────────────────
 
@@ -612,24 +760,53 @@ def _render_claims(claims: list[Claim]) -> tuple[str, str]:
     """把 Claim 列表渲染成两块文本，供 synthesizer 的真假两条路径共用：
 
     - claims_block：编号结论清单，既是喂给 Synthesizer 提示词的 {claims}
-      占位符内容，也是假数据模式下报告正文本身。insufficient 的
-      "存疑：证据不足"标注在这一步就由代码写死，不指望 LLM 自己判断每条
-      状态该怎么措辞——LLM 只需要在已经标好状态的清单基础上组织行文。
-      判定条件是 `status == "supported" and citations` 而不是只看
-      status：哪怕模型把 status 字符串写偏了、或者写了 supported 但没带
-      citations，也一律按"存疑"渲染——保守是安全的方向，把没证据的结论
-      当"已证实"渲染出去才是危险的方向。
+      占位符内容，也是假数据模式下报告正文本身。每条的措辞在这一步就由
+      代码写死，不指望 LLM 自己判断每条状态该怎么措辞——LLM 只需要在已经
+      标好状态的清单基础上组织行文。
     - citations_block：报告末尾的引用清单，每条渲染成 "[n] file:L起-L止"，
       与 claims_block 里的 [n] 共用同一套编号，读者从结论跳引用不需要
       换算。这一块无论真旗舰档路径还是假数据路径都由代码直接拼出来、不
       经过 LLM 复述——引用格式的正确性不能赌 LLM 会不会抄对，必须由代码
       兜底保证（呼应 D3"证据是结构化对象、不是文本"）。
+
+    D3 升级：渲染以 verdict 优先于 status（三分支，按优先级判断"这条该不
+    该按支持渲染"）：
+    - verdict == "refuted"：Worker 曾自称 supported，但 Verifier 回读引用
+      没能核实——这与"Worker 自己就说证据不足"是完全不同的两种情况，必须
+      让读者一眼看出"这条曾经自称有证据、核验没过"，不能和天然的
+      insufficient 混进同一种"存疑"措辞里，单独给一种"已核验驳回"样式；
+      驳回的引用不进入 citations_block——把没通过核验的引用继续挂进"可
+      信引用清单"是危险方向，宁可读者觉得"这条没有引用可查"。
+    - verdict == "supported"：Verifier 独立复核通过，按支持结论正常渲染
+      （今晚 _judge_claim 还不会真的产出这个值——语义判定明天才定案——这
+      条分支是为规则本体落地后预留，不是死代码）。
+    - verdict is None（未核验：含 Verifier 关闭、或还没轮到判定规则那一
+      步）：退回升级前的现状——`status == "supported" and citations` 才
+      按支持渲染，哪怕模型把 status 字符串写偏了、或者写了 supported 但
+      没带 citations，也一律按"存疑"渲染，保守是安全的方向。
+    - 其余取值（如 "insufficient"，_judge_claim 今晚不会产出，为字段的
+      三值定义预留）：同样按"存疑"保守渲染，未知的 verdict 取值不该被
+      当成"已证实"处理。
     """
     claim_lines: list[str] = []
     citation_lines: list[str] = []
     n = 0
     for claim in claims:
-        if claim.status == "supported" and claim.citations:
+        if claim.verdict == "refuted":
+            claim_lines.append(
+                f"- 已核验驳回 —— {claim.statement}"
+                f"（Worker 曾自称 supported，但引用未通过 Verifier 核验；{claim.target_module}）"
+            )
+            continue
+
+        if claim.verdict == "supported":
+            is_supported = True
+        elif claim.verdict is None:
+            is_supported = claim.status == "supported" and bool(claim.citations)
+        else:
+            is_supported = False  # 预留：insufficient 等未来取值一律按"存疑"保守渲染
+
+        if is_supported:
             marks = []
             for c in claim.citations:
                 n += 1
@@ -644,8 +821,9 @@ def _render_claims(claims: list[Claim]) -> tuple[str, str]:
 
 def synthesizer(state: State) -> dict:
     """把全部 Worker 产出的 Claim 合成一份带引用的调研报告（旗舰档：最终
-    质量门面）。"""
-    claims_block, citations_block = _render_claims(state["claims"])
+    质量门面）。读 verified_claims（verifier 的产出）而不是 claims（Worker
+    的原始产出）——开关关闭时两者逐字一致，开关打开时前者带了 verdict。"""
+    claims_block, citations_block = _render_claims(state["verified_claims"])
     tier = config.try_flagship_tier()
     if tier is None:  # 假数据模式：不调用任何 LLM，报告正文就是渲染好的结论清单
         body = claims_block
@@ -665,15 +843,17 @@ def synthesizer(state: State) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 def build_graph():
-    """START → planner ═(Send×N 动态并行)═> worker → synthesizer → END"""
+    """START → planner ═(Send×N 动态并行)═> worker → verifier → synthesizer → END"""
     g = StateGraph(State)
     g.add_node("planner", planner)
     g.add_node("worker", worker)
+    g.add_node("verifier", verifier)
     g.add_node("synthesizer", synthesizer)
 
     g.add_edge(START, "planner")
     g.add_conditional_edges("planner", fan_out, ["worker"])
-    g.add_edge("worker", "synthesizer")
+    g.add_edge("worker", "verifier")
+    g.add_edge("verifier", "synthesizer")
     g.add_edge("synthesizer", END)
     return g.compile()
 

@@ -90,6 +90,27 @@ def try_flagship_tier() -> ModelTier | None:
         return None
 
 
+def verifier_enabled() -> bool:
+    """Verifier 节点的开关（D3）：读 VERIFIER_ENABLED 环境变量，默认关闭。
+
+    这个开关就是将来"Verifier 开/关 ablation"的闸门本体——README 里点名
+    的核心数字（同一评测集在开关两种状态下各跑一遍的引用错误率差值）就是
+    拿这个开关一开一关跑出来的，不是另外发明一套双跑机制，评测阶段直接
+    复用它。默认关闭是因为 graph._judge_claim 的判定规则本体（分工红线
+    §3：Ziyang 亲手写）今晚还没有定案——提前默认打开只会让每条 claim 在
+    存在性检查通过后都撞上 NotImplementedError（被节点兜底成
+    verdict=None），既没有意义，又会让人误以为核验已经在生效。
+
+    与上面 try_cheap_tier/try_flagship_tier 是同一条"环境变量即配置来源"
+    的原则，但返回形状故意不同：那两个要么给一个能构造好的 ModelTier、
+    要么给 None（下游据此整体切换到假数据模式，"能不能构造出一个客户端"
+    是它们要回答的问题）；这里只是一个布尔开关，天生没有"构造失败"这一说
+    ——所以直接返回 bool、不叫 try_verifier_enabled，命名如实反映两者是
+    不同性质的读取结果，不是偷懒少写一个 try。
+    """
+    return os.getenv("VERIFIER_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def langfuse_handler() -> CallbackHandler | None:
     """T8 可观测性埋点：三个 Langfuse env（PUBLIC_KEY/SECRET_KEY/HOST）任一
     为空就返回 None，调用方拿到 None 就不传 callbacks，整条链路与接入
