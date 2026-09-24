@@ -10,13 +10,13 @@ To verify citation integrity against a local checkout, check its HEAD and compar
 
 ## Offline validation
 
-Use a clean checkout of FastMCP at `f4ae8bb0af04cb315eef262d38433af4b71d9c38`:
+Use a fresh dedicated checkout of FastMCP at `f4ae8bb0af04cb315eef262d38433af4b71d9c38`. Keep virtual environments, caches, and scratch files outside that checkout: evaluation rejects ignored files as well as ordinary untracked or modified files, since repository tools could otherwise read code absent from the pinned commit.
 
 ```sh
 PYTHONPATH=src python scripts/evaluate.py validate-corpus --repo /path/to/fastmcp
 ```
 
-This checks the actual Git HEAD, a clean working tree including untracked files, all ten questions, and every snippet against its inclusive line range at the pinned commit. It makes no model or network calls. The current draft has 20 source references. A matching snippet means the reference is mechanically intact; it does not establish that the prose answer is correct.
+This checks the actual Git HEAD, a clean working tree including untracked and ignored files, all ten questions, and every snippet against its inclusive line range at the pinned commit. It makes no model or network calls. The current draft has 20 source references. A matching snippet means the reference is mechanically intact; it does not establish that the prose answer is correct.
 
 ## Run bounded measurements
 
@@ -41,11 +41,11 @@ PYTHONPATH=src python scripts/evaluate.py run \
   --output /tmp/repo-audit-real-fmcp01.jsonl
 ```
 
-The runner enables the deterministic citation verifier. Each JSONL record includes source HEAD and dirty state before and after, engine HEAD and dirty state, corpus SHA-256, Python and dependency versions, tier model names, budget, task count, configured concurrency limit, elapsed time, report, raw and checked claims, and callback token usage by tier. An exception yields a sanitized `error_type` and no successful report. A source change yields `source_changed`, drops the report, and stops the batch. The task count is the Planner's number of subtasks; configured concurrency is a separate limit, not observed simultaneous API calls.
+The runner enables the deterministic citation verifier. Each JSONL record includes source HEAD, dirty state, and ignored-file presence before and after, engine identity, corpus SHA-256, Python and dependency versions, tier model names, budget, task count, configured concurrency limit, elapsed time, report, raw and checked claims, and callback token usage by tier. An exception yields a sanitized `error_type` and no successful report. A source change, including an ignored file appearing during a run, yields `source_changed`, drops the report, and stops the batch. The task count is the Planner's number of subtasks; configured concurrency is a separate limit, not observed simultaneous API calls.
 
 `raw_supported_count` is the Worker's own status. `raw_citation_count` counts every claim citation. `citation_valid_claim_count` counts claims whose deterministic `citation_status` is `valid` and have citations. `citations_on_all_valid_claims` counts citations on those claims. `semantic_verified_count` counts non-null independent verdicts; in this deterministic first round it should be zero. These are not answer accuracy measurements. Token fields are `null` if any model response for that tier omitted usage; missing usage is never treated as zero.
 
-Cost is `null` unless an explicit rate JSON file is passed using `--rates`. Rates use the actual configured tier model prices and must include a currency, source, date, and input/output prices per million tokens. For example, **replace these illustrative values with verified rates before use**:
+Cost is `null` unless an explicit rate JSON file is passed using `--rates`. Rates use the actual configured tier model prices and must include a currency, source, date, and finite nonnegative numeric input/output prices per million tokens; booleans and nonfinite values are rejected before a run. For example, **replace these illustrative values with verified rates before use**:
 
 ```json
 {

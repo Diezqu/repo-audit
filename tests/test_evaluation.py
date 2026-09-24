@@ -11,6 +11,7 @@ from repo_audit.evaluation import (
     measure_claims,
     run_evaluation,
     validate_corpus,
+    validate_rates,
 )
 
 COMMIT = "f4ae8bb0af04cb315eef262d38433af4b71d9c38"
@@ -175,3 +176,71 @@ def test_demo_clears_all_model_settings_and_does_not_call_api(source, tmp_path, 
     assert record["quality_metrics_eligible"] is False
     assert record["models"] == {"cheap": None, "flagship": None}
     assert "private-value" not in output.read_text()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1, True, False])
+@pytest.mark.parametrize("field", ["input_per_million", "output_per_million"])
+def test_rates_reject_invalid_prices(value, field):
+    rates = {"currency": "USD", "source": "manual", "date": "2026-09-24", "tiers": {
+        tier: {"input_per_million": 0, "output_per_million": 2.5}
+        for tier in ("cheap", "flagship")
+    }}
+    rates["tiers"]["cheap"][field] = value
+    with pytest.raises(ValueError, match="Invalid cheap"):
+        validate_rates(rates)
+
+
+def test_rates_accept_zero_integer_and_float_prices():
+    rates = {"currency": "USD", "source": "manual", "date": "2026-09-24", "tiers": {
+        "cheap": {"input_per_million": 0, "output_per_million": 2.5},
+        "flagship": {"input_per_million": 3, "output_per_million": 4.5},
+    }}
+    assert validate_rates(rates) == rates
+
+
+@pytest.fixture
+def ignored_source(source):
+    (source / ".gitignore").write_text("scratch.py\n")
+    git(source, "add", ".gitignore")
+    git(source, "-c", "user.name=test", "-c", "user.email=t@example.test",
+        "commit", "-qm", "ignore scratch")
+    return source
+
+
+def test_run_rejects_ignored_source_files_before_invocation(ignored_source, tmp_path):
+    source = ignored_source
+    commit = git(source, "rev-parse", "HEAD")
+    corpus = corpus_file(tmp_path, commit)
+    (source / "scratch.py").write_text("uncommitted source\n")
+    assert git(source, "status", "--porcelain", "--untracked-files=all") == ""
+    output = tmp_path / "ignored.jsonl"
+
+    def must_not_run(*_args):
+        pytest.fail("Graph must not run against ignored source files")
+
+    with pytest.raises(ValueError, match="ignored"):
+        run_evaluation(corpus, source, output, mode="demo", expected_count=1,
+                       expected_commit=commit, invoke=must_not_run)
+    assert not output.exists()
+
+
+def test_run_invalidates_result_when_ignored_file_appears(ignored_source, tmp_path):
+    source = ignored_source
+    commit = git(source, "rev-parse", "HEAD")
+    corpus = corpus_file(tmp_path, commit)
+    output = tmp_path / "changed.jsonl"
+
+    def changing_graph(*_args):
+        (source / "scratch.py").write_text("uncommitted source\n")
+        return {"subtasks": [], "claims": [], "verified_claims": [], "report": "fake"}
+
+    result = run_evaluation(corpus, source, output, mode="demo", repeats=3,
+                            expected_count=1, expected_commit=commit, invoke=changing_graph)
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert result["status"] == "source_changed"
+    assert result["records_written"] == len(records) == 1
+    assert records[0]["source_before"]["ignored"] is False
+    assert records[0]["source_after"]["ignored"] is True
+    assert records[0]["status"] == "source_changed"
+    assert records[0]["measurement_eligible"] is False
+    assert records[0]["report"] is None

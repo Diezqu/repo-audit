@@ -7,6 +7,7 @@ module never scores answer correctness from strings or snippets.
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import subprocess
@@ -33,11 +34,12 @@ def _git(root: Path, *args: str) -> str:
 
 
 def git_identity(root: Path) -> dict:
-    """Capture the actual checkout commit and dirty state, including untracked files."""
+    """Capture the checkout commit and untracked/ignored file presence."""
     root = Path(root).resolve()
     return {
         "commit": _git(root, "rev-parse", "HEAD").strip(),
         "dirty": bool(_git(root, "status", "--porcelain", "--untracked-files=all")),
+        "ignored": bool(_git(root, "ls-files", "--others", "--ignored", "--exclude-standard")),
     }
 
 
@@ -66,6 +68,8 @@ def validate_corpus(
     identity = git_identity(repo_root)
     if identity["dirty"]:
         raise ValueError("Source checkout is dirty")
+    if identity["ignored"]:
+        raise ValueError("Source checkout contains ignored files; use a fresh dedicated checkout")
     if identity["commit"] != expected_commit:
         raise ValueError("Source commit does not match pinned commit")
     if len(expected_commit) != 40 or any(c not in "0123456789abcdef" for c in expected_commit):
@@ -248,7 +252,8 @@ def validate_rates(rates: dict | None) -> dict | None:
             raise ValueError(f"Invalid {tier} rates")
         for field in ("input_per_million", "output_per_million"):
             value = tiers[tier].get(field)
-            if not isinstance(value, (int, float)) or value < 0:
+            if (not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0
+                    or (isinstance(value, float) and not math.isfinite(value))):
                 raise ValueError(f"Invalid {tier} {field} rate")
     return rates
 
@@ -303,7 +308,7 @@ def run_evaluation(
         for repeat in range(1, repeats + 1):
             for item in corpus:
                 before = git_identity(repo_root)
-                if before["dirty"] or before["commit"] != expected_commit:
+                if before["dirty"] or before["ignored"] or before["commit"] != expected_commit:
                     raise ValueError("Source changed before next question; evaluation stopped")
                 usage = TierUsage()
                 started = time.perf_counter()
@@ -319,7 +324,7 @@ def run_evaluation(
                     error_type = type(exc).__name__
                 elapsed = time.perf_counter() - started
                 after = git_identity(repo_root)
-                stable = before == after and not after["dirty"]
+                stable = before == after and not after["dirty"] and not after["ignored"]
                 status = "source_changed" if not stable else ("error" if error_type else "ok")
                 if status == "error":
                     error_records += 1
