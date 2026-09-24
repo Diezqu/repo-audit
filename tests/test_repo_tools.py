@@ -1,4 +1,4 @@
-"""仓库工具四件套(T3)单测。
+"""仓库工具四件套单测。
 
 两层 fixture 缺一不可：
   - tmp_path 造的最小合成仓库——用来精确断言行号/截断阈值/护栏这些
@@ -7,12 +7,8 @@
     混杂(有 .git/.venv/多种文件类型)的仓库上跑得通，不是只在玩具数据上
     工作。任务要求"用本仓库自身当 fixture"，就是奔着这层去的。
 
-rg 分支的测试策略：这台机器上没有真的装 ripgrep(`shutil.which("rg")`
-在 subprocess 能找到的 PATH 里查不到——交互式 shell 里的 `rg` 其实是
-Claude Code 自带的 shell 函数壳，不是独立二进制，子进程调用看不到它)。
-所以"纯 Python 回退路径"是这台机器上真实会走到的代码，直接测；
-"rg 路径"用 monkeypatch 伪造 shutil.which + subprocess.run 来测命令构造
-与输出解析是否正确——不依赖测试机是否装了 rg，两条路径的覆盖都不看运气。
+纯 Python 分支通过 monkeypatch 强制执行；rg 分支的命令构造用替身验证，
+真实 rg 可用时另跑集成测试。
 """
 
 import shutil
@@ -81,6 +77,53 @@ def test_read_file_within_root_is_allowed(sample_repo):
     assert "Sample" in text
 
 
+def test_read_file_allows_symlink_within_root(sample_repo):
+    (sample_repo / "internal_link").symlink_to(sample_repo / "README.md")
+    assert "Sample" in read_file(sample_repo, "internal_link")
+
+
+@pytest.fixture
+def repo_with_external_links(sample_repo, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside")
+    (outside / "external.txt").write_text("external_sentinel\n")
+    (sample_repo / "linked_dir").symlink_to(outside, target_is_directory=True)
+    (sample_repo / "linked_file").symlink_to(outside / "external.txt")
+    (sample_repo / "loop").symlink_to(sample_repo, target_is_directory=True)
+    return sample_repo
+
+
+def test_repo_tree_omits_symlinks(repo_with_external_links):
+    tree = repo_tree(repo_with_external_links, max_depth=3)
+    assert "linked_dir" not in tree
+    assert "linked_file" not in tree
+    assert "loop" not in tree
+    assert "external.txt" not in tree
+
+
+def test_repo_stats_omits_symlinks(repo_with_external_links):
+    stats = repo_stats(repo_with_external_links)
+    assert stats.total_files == 3
+
+
+@pytest.mark.parametrize("use_rg", [False, True])
+def test_grep_repo_omits_symlinks(repo_with_external_links, monkeypatch, use_rg):
+    if use_rg and shutil.which("rg") is None:
+        pytest.skip("需要真实安装 rg")
+    if not use_rg:
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert grep_repo(repo_with_external_links, "external_sentinel") == "(无匹配)"
+
+
+def test_repo_stats_does_not_read_linked_readme(sample_repo, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside_readme") / "README.md"
+    outside.write_text("external_sentinel\n")
+    (sample_repo / "README.md").unlink()
+    (sample_repo / "README.md").symlink_to(outside)
+    stats = repo_stats(sample_repo)
+    assert stats.total_files == 2
+    assert all("external_sentinel" not in hint for hint in stats.entry_hints)
+
+
 # ──────────────────────────────────────────────────────────────
 # 行号正确性
 # ──────────────────────────────────────────────────────────────
@@ -144,6 +187,30 @@ def test_grep_repo_exact_boundary_not_marked_truncated(sample_repo):
     assert len(out.splitlines()) == 3
 
 
+@pytest.mark.skipif(shutil.which("rg") is None, reason="需要真实安装 rg")
+def test_grep_repo_rg_reports_more_than_limit_in_one_file(sample_repo):
+    (sample_repo / "many.txt").write_text("needle\nneedle\nneedle\n")
+    out = grep_repo(sample_repo, "needle", glob="many.txt", max_results=2)
+    assert "已截断" in out
+    assert len(out.split("\n\n…")[0].splitlines()) == 2
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="需要真实安装 rg")
+def test_grep_repo_rg_searches_unversioned_root_and_excludes_noise(tmp_path, monkeypatch):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "hit.txt").write_text("boundary_token\n")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "hidden.txt").write_text("boundary_token\n")
+    real_run = subprocess.run
+
+    def run_with_piped_stdin(*args, **kwargs):
+        return real_run(*args, stdin=subprocess.PIPE, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run_with_piped_stdin)
+    out = grep_repo(tmp_path, "boundary_token")
+    assert out == "src/hit.txt:1:boundary_token"
+
+
 def test_repo_tree_line_limit_truncates(sample_repo):
     text = repo_tree(sample_repo, max_depth=2, line_limit=2)
     assert "已截断" in text
@@ -178,7 +245,7 @@ def test_repo_tree_skips_noise_dirs(sample_repo):
 
 
 # ──────────────────────────────────────────────────────────────
-# grep_repo：纯 Python 回退路径(这台机器的真实代码路径)
+# grep_repo：纯 Python 回退路径
 # ──────────────────────────────────────────────────────────────
 
 def test_grep_repo_pure_python_finds_match(sample_repo, monkeypatch):

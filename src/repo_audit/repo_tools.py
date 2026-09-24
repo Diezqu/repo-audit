@@ -1,8 +1,8 @@
 """仓库工具四件套(T3)：Worker 取证的全部手段。
 
 方案 E 的检索选型是"结构化导航，不用向量库"(DECISIONS.md D15、五问弹药 #2)——
-代码是精确标识符的世界，grep 找函数名/类名零误差；embedding 反而把代码结构切碎，
-召回模糊。这四个函数就是那句话的全部实现：
+代码里常可用标识符定位候选位置；grep 的结果仍需回读核验。
+这四个函数提供结构化导航：
   repo_tree  给 Planner 一张地图(读全貌，决定拆哪些子任务)
   repo_stats 给 Planner 语言构成 + 入口线索(地图的文字摘要版)
   grep_repo  给 Worker 按关键字定位候选行(取证的主力工具)
@@ -91,16 +91,20 @@ def _finalize(lines: list[str], line_limit: int = MAX_LINES, char_limit: int = M
 
 
 def _iter_files(root: Path):
-    """遍历 root 下所有文件，跳过噪音目录——repo_stats 与 grep 的纯 Python
-    回退共用这一份枚举逻辑，"什么算仓库内容"只定义一次，不允许两处各写一套
-    互相不一致的过滤规则。
+    """遍历 root 下的普通文件，跳过噪音路径与符号链接。
+
+    repo_stats 与 grep 的纯 Python 回退共用这份枚举逻辑。
     """
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _SKIP_DIRS and not (Path(dirpath) / d).is_symlink()
+        )
         for name in sorted(filenames):
-            if name in _SKIP_FILES:
+            path = Path(dirpath) / name
+            if name in _SKIP_FILES or path.is_symlink():
                 continue
-            yield Path(dirpath) / name
+            yield path
 
 
 # ── repo_tree ────────────────────────────────────────────────────
@@ -124,7 +128,9 @@ def repo_tree(root: str | Path, max_depth: int = 2, *, line_limit: int = MAX_LIN
             return
         entries = [
             e for e in raw_entries
-            if e.name not in _SKIP_FILES and not (e.is_dir() and e.name in _SKIP_DIRS)
+            if not e.is_symlink()
+            and e.name not in _SKIP_FILES
+            and not (e.is_dir() and e.name in _SKIP_DIRS)
         ]
         entries.sort(key=lambda e: (e.is_file(), e.name.lower()))
         for i, entry in enumerate(entries):
@@ -179,12 +185,11 @@ def grep_repo(
     *,
     max_results: int = MAX_LINES,
 ) -> str:
-    """优先 subprocess 调 ripgrep；机器没有 rg 时回退纯 Python 逐行匹配。
+    """优先调用 ripgrep；没有 rg 或调用失败时回退到纯 Python 逐行匹配。
 
-    两条路径产出完全相同的格式(rel/path:行号:内容)，调用方不需要知道当前
-    机器有没有装 rg——"回退"意味着功能对等，不是残废替代品。pattern 统一按
-    Python 正则语义预校验(两条路径共用同一次校验)，非法正则在真正开始扫描
-    前就报错，而不是让 rg 和纯 Python 各给一种报错格式。
+    两条路径返回同一行格式(rel/path:行号:内容)，并跳过符号链接及噪音路径。
+    Python 正则预校验只统一非法表达式的报错；rg 与 Python 的正则引擎、
+    glob 规则及二进制文件处理并非完全相同，复杂查询可能产生不同命中。
     """
     root = Path(root).resolve()
     try:
@@ -202,16 +207,21 @@ def grep_repo(
 
 def _grep_with_rg(root: Path, pattern: str, glob: str | None, max_results: int) -> str:
     cmd = [
-        "rg", "--line-number", "--no-heading", "--color=never",
-        "--max-count", str(max_results),  # 单文件内的安全阀；跨文件总量仍由 _finalize 兜底
+        "rg", "--no-config", "--no-follow", "--hidden", "--no-ignore",
+        "--line-number", "--no-heading", "--color=never",
+        "--max-count", str(max_results + 1),  # 每文件多取一条，探测恰好越过总上限
     ]
     if glob:
         cmd += ["--glob", glob]
-    cmd += ["--", pattern]
+    for name in sorted(_SKIP_DIRS):
+        cmd += ["--glob", f"!**/{name}/**"]
+    for name in sorted(_SKIP_FILES):
+        cmd += ["--glob", f"!**/{name}"]
+    cmd += ["--", pattern, "."]  # 显式搜索 root；非交互环境下 rg 否则可能读 stdin
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, cwd=root, check=False)
     if proc.returncode not in (0, 1):  # 1 = 无匹配，是正常结果不是错误
         raise subprocess.SubprocessError((proc.stderr or "rg 非零退出").strip())
-    lines = [ln for ln in proc.stdout.splitlines() if ln]
+    lines = [ln.removeprefix("./") for ln in proc.stdout.splitlines() if ln]
     if not lines:
         return "(无匹配)"
     return _finalize(lines, max_results)
@@ -293,7 +303,7 @@ class RepoStats:
 def _find_first(root: Path, names: tuple[str, ...]) -> Path | None:
     for name in names:
         candidate = root / name
-        if candidate.is_file():
+        if not candidate.is_symlink() and candidate.is_file():
             return candidate
     return None
 
@@ -323,8 +333,8 @@ def repo_stats(root: str | Path, *, hint_lines: int = 12) -> RepoStats:
     if readme is not None:
         head = readme.read_text(encoding="utf-8", errors="replace").splitlines()[:hint_lines]
         hints.append(f"{readme.name} 头部：\n    " + "\n    ".join(head))
-    pyproject = root / "pyproject.toml"
-    if pyproject.is_file():
+    pyproject = _find_first(root, ("pyproject.toml",))
+    if pyproject is not None:
         head = pyproject.read_text(encoding="utf-8", errors="replace").splitlines()[:hint_lines]
         hints.append("pyproject.toml 概要：\n    " + "\n    ".join(head))
 
