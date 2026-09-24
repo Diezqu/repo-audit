@@ -10,7 +10,7 @@ docs/prompts-v2-draft.md，本文件只做"照图纸接线"，不重新发明设
 见 config.py），真正换的是"Worker 拿什么取证"这件事本身：
 
 1. Planner（旗舰档）：只看仓库「地图」（repo_stats + 深度 2 目录树 + README
-   头部），把「读懂这个仓库」拆成 3~8 个可并行、自包含的
+   头部），围绕用户问题拆成 1~8 个可并行、自包含的
    SubTask{target_module, questions}——不喂文件正文，职责分离与上下文经济
    的理由见草案 §1.4。
 2. Worker（便宜档 × N，Send 动态并行）：每条 SubTask 配一个手写工具循环
@@ -60,7 +60,7 @@ from langchain_core.tools import tool
 from langfuse import get_client
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from repo_audit import config
 from repo_audit.repo_tools import (
@@ -82,6 +82,9 @@ from repo_audit.repo_tools import (
 # 数据结构
 # ──────────────────────────────────────────────────────────────
 
+_NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
 class SubTask(BaseModel):
     """Planner 拆出的一个可并行、自包含的子任务（草案 §1.2）。
 
@@ -89,15 +92,16 @@ class SubTask(BaseModel):
     的对象"，因为 Worker 现在要知道去哪块代码查，而不是拿一句话满仓库乱翻。
     """
 
-    target_module: str        # 该子任务聚焦的目录/模块/文件（从目录树里挑）
-    questions: list[str]      # 1~3 个"读这块代码就能回答"的具体问题
+    target_module: _NonBlank  # 该子任务聚焦的目录/模块/文件（从目录树里挑）
+    questions: list[_NonBlank] = Field(min_length=1, max_length=3)
     # v1 先不加 question_type 字段——本周没有消费方（Verifier 不看它、报告
     # 不按它分组），没有消费方的字段就是负债，见草案 §1.4 末段。
 
 
 class Plan(BaseModel):
     subtasks: list[SubTask] = Field(
-        description="3~8 个可并行、独立调研的子任务；仓库过小可酌减，不许注水凑数"
+        min_length=1, max_length=8,
+        description="1~8 个可并行、独立调研的子任务；仓库过小可酌减，不许注水凑数",
     )
 
 
@@ -217,7 +221,9 @@ def _readme_head(root: Path, *, max_lines: int = 60, max_chars: int = 2000) -> s
     return "（无 README）"
 
 
-PLANNER_PROMPT = """你是代码库调研的规划者。你面前只有一个陌生仓库的「地图」——统计信息、浅层目录树、README 开头——你的唯一职责是把「读懂这个仓库」拆成 3~8 个可以并行、独立调研的子任务，交给下游的 Worker 逐个去代码里取证。
+PLANNER_PROMPT = """你是代码库调研的规划者。你面前只有一个陌生仓库的「地图」——统计信息、浅层目录树、README 开头——你的职责是围绕用户问题拆出可以并行、独立调研的子任务，交给下游的 Worker 逐个去代码里取证。
+
+用户问题：{question}
 
 严格约束：
 - 你只做拆解，不做回答。你看不到文件正文，任何结论都不该由你给出——读代码下结论是 Worker 的活。
@@ -236,7 +242,7 @@ PLANNER_PROMPT = """你是代码库调研的规划者。你面前只有一个陌
 - target_module：该子任务落在哪个目录/模块/文件（从上面的目录树里挑；拿不准就填最相关的顶层目录，别填一个树里没有的路径）
 - questions：1~3 个"读这块代码就能回答"的具体问题。要能被 file:行号 回答，别问"介绍一下 X"这种泛问。
 
-数量：目标 3~8 个。仓库很小就少拆几个（宁少毋凑）；很大也别超 8——把同一模块的问题合并成一条。
+数量：1~8 个。按用户问题所需范围拆分，仓库很小就少拆几个（宁少毋凑）；很大也别超 8——把同一模块的问题合并成一条。
 
 ──────── 仓库地图 ────────
 [统计]
@@ -250,8 +256,11 @@ PLANNER_PROMPT = """你是代码库调研的规划者。你面前只有一个陌
 
 
 def planner(state: State) -> dict:
-    """把「读懂这个仓库」拆成 3~8 个可并行调研的子任务（旗舰档：拆解质量
+    """围绕用户问题拆成 1~8 个可并行调研的子任务（旗舰档：拆解质量
     决定全局，草案 §1.4）。"""
+    question = state.get("question")
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question must be a nonblank string")
     tier = config.try_flagship_tier()
     if tier is None:  # 假数据模式（D6）：结构与真路径完全一致，CI 无密钥照跑
         return {
@@ -265,6 +274,7 @@ def planner(state: State) -> dict:
         }
     root = Path(state["repo_root"])
     prompt = PLANNER_PROMPT.format(
+        question=question,
         repo_stats=repo_stats(root).render(),
         tree=_repo_tree(root, 2),
         readme_head=_readme_head(root),
@@ -274,7 +284,7 @@ def planner(state: State) -> dict:
     # BATTLE_LOG 2026-07-03），用两家都兼容的工具调用协议取结构化输出。
     # 这条不许改——踩过一次真故障。
     llm = tier.client(temperature=0).with_structured_output(Plan, method="function_calling")
-    plan = llm.invoke(prompt)
+    plan = Plan.model_validate(llm.invoke(prompt))
     return {"subtasks": plan.subtasks}
 
 
@@ -447,7 +457,7 @@ def _fake_claims(task: WorkerInput) -> list[Claim]:
 
 
 def _handle_tool_calls(
-    ai_msg, tool_map: dict, messages: list, query_calls: int
+    ai_msg, tool_map: dict, messages: list, query_calls: int, *, allow_queries: bool = True
 ) -> tuple[WorkerOutput | None, int]:
     """执行一轮 AI 消息里的全部 tool_calls，把结果回填成 ToolMessage。
 
@@ -476,8 +486,8 @@ def _handle_tool_calls(
     for invalid in ai_msg.invalid_tool_calls:
         if invalid.get("id") is None:
             continue  # 极端情况下连 id 都没有，没法定向回复给哪条调用，只能跳过
-        if invalid.get("name") in _QUERY_TOOL_NAMES:
-            query_calls += 1
+        if invalid.get("name") != "submit_claims":
+            query_calls = min(MAX_QUERY_CALLS, query_calls + 1)
         messages.append(
             ToolMessage(
                 content=f"调用解析失败（参数不是合法 JSON）：{invalid.get('error')}；请重新调用，"
@@ -490,17 +500,34 @@ def _handle_tool_calls(
         name = tool_call["name"]
         if name == "submit_claims":
             try:
-                output = WorkerOutput.model_validate(tool_call["args"])
+                submitted = WorkerOutput.model_validate(tool_call["args"])
             except Exception as exc:  # noqa: BLE001 — 参数形状不对，回错让模型自己改，不崩
                 messages.append(
                     ToolMessage(content=f"提交失败，参数不合法：{exc}", tool_call_id=tool_call["id"])
                 )
                 continue
+            if output is None:
+                output = submitted
             messages.append(ToolMessage(content="已收到", tool_call_id=tool_call["id"]))
             continue
 
-        if name in _QUERY_TOOL_NAMES:
-            query_calls += 1
+        budget_available = query_calls < MAX_QUERY_CALLS
+        query_calls = min(MAX_QUERY_CALLS, query_calls + 1)
+        if name not in _QUERY_TOOL_NAMES or name not in tool_map:
+            messages.append(
+                ToolMessage(content=f"未知工具：{name}", tool_call_id=tool_call["id"])
+            )
+            continue
+        if not allow_queries:
+            messages.append(
+                ToolMessage(content="交卷阶段不可调用查证工具", tool_call_id=tool_call["id"])
+            )
+            continue
+        if not budget_available:
+            messages.append(
+                ToolMessage(content="查证工具预算已用尽", tool_call_id=tool_call["id"])
+            )
+            continue
         try:
             result = tool_map[name].invoke(tool_call["args"])
         except (PathEscapeError, ValueError, FileNotFoundError) as exc:
@@ -612,7 +639,9 @@ def worker(task: WorkerInput) -> dict:
             except Exception:  # noqa: BLE001, S112 — 供应商不认这个 tool_choice 形态：换下一档，不崩
                 continue
             messages.append(ai_msg)
-            output, _ = _handle_tool_calls(ai_msg, tool_map, messages, query_calls)
+            output, _ = _handle_tool_calls(
+                ai_msg, tool_map, messages, query_calls, allow_queries=False
+            )
             if output is not None:
                 break
 
