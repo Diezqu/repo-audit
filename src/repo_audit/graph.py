@@ -1,81 +1,48 @@
-"""repo-audit v2：Planner 读仓库地图拆解 → 并行 Worker 用本地工具取证 → 合成器出带引用的调研报告。
+"""Plan repository questions, collect worker claims, and verify citations.
 
-这是 D15 换域（消费选品 → 代码库调研核验，见 DECISIONS.md）之后的第二版状态机，
-整体重写自消费版的三节点实现（v1 长这样：Planner 拆一串子问题字符串 →
-Worker 网络搜索/模型知识作答 → 合成决策报告；这段历史已被本文件取代，
-git 历史留痕，不需要在这里追述）。提示词全文与逐条设计理由见
-docs/prompts-v2-draft.md，本文件只做"照图纸接线"，不重新发明设计。
-
-三个节点、双档路由的骨架继承自 v1（Planner/合成器旗舰档、Worker 便宜档，
-见 config.py），真正换的是"Worker 拿什么取证"这件事本身：
-
-1. Planner（旗舰档）：只看仓库「地图」（repo_stats + 深度 2 目录树 + README
-   头部），把「读懂这个仓库」拆成 3~8 个可并行、自包含的
-   SubTask{target_module, questions}——不喂文件正文，职责分离与上下文经济
-   的理由见草案 §1.4。
-2. Worker（便宜档 × N，Send 动态并行）：每条 SubTask 配一个手写工具循环
-   （不用 create_react_agent——拍板已定：手写循环的每一步都是显式代码，
-   面试时能逐行讲清楚"数了几次工具调用、超限后怎么强制收尾、工具异常怎么
-   喂回去"；create_react_agent 把这整个循环封装成黑盒，出问题或要讲设计
-   时反而讲不清楚。这与 D2 选 LangGraph 而非 CrewAI 是同一个哲学：显式
-   状态机 > 封装好的黑盒）。工具是 T3 四件套里的三个只读工具
-   （repo_tree/read_file/grep_repo，root 已闭包绑定，不出现在模型可见的
-   参数里），外加一个终结工具 submit_claims 把交卷也纳入同一条
-   function_calling 通道——理由见草案 §2.4 末段（bind_tools 与
-   with_structured_output 在同一次调用里打架，解法是把"交卷"也做成工具）。
-3. Synthesizer（旗舰档）：把全部 Worker 产出的 Claim 合成一份结论先行、
-   带 [n] 引用编号的调研报告，insufficient 的结论显式标"存疑：证据不足"，
-   引用清单由代码而非 LLM 兜底渲染成 file:L起-L止——格式的正确性不指望
-   LLM 抄对，这是 D3"证据是结构化对象、不是文本"同一个原则的延伸。
-4. Verifier（管道已接、判定规则待定，见下）：静态边接在 worker 与
-   synthesizer 之间，读 config.verifier_enabled()（VERIFIER_ENABLED 环境
-   变量，默认关）——关闭时原样透传 claims（今天的输出与还没有这一层完全
-   一致），打开时对每条 claim 调 _judge_claim 独立核验。
-
-无密钥时（config.try_*_tier() 返回 None）上面三个模型节点（Planner/
-Worker/Synthesizer）各自走确定性假数据分支，结构与真路径完全一致——D6
-"骨架无密钥可跑"的约定原样保留，只是假数据的形状换成了新的 SubTask/
-Claim。Verifier 不在此列：它不读任何模型档，是否运行只取决于
-VERIFIER_ENABLED 这一个开关，与有没有密钥无关。
-
-Verifier 判定规则本版尚未定案（管道已接、规则待定）：回读 file:line 独立
-核验 supported/refuted/insufficient 是 Ziyang 接下来要亲手写的判断题本体，
-见分工红线 §3——今晚（D3 管道脚手架）只落地了这道判断题上游、无争议的一段：
-引用的 file:line 是否真实存在（存在性检查，见 _judge_claim）。存在性检查
-之后"这几行代码是否真的支持这句话"的语义判定，_judge_claim 显式抛出
-NotImplementedError，不是漏做、是红线本身。Claim.verdict 字段（与 Worker
-自述的 status 语义分工见 Claim 类注释）就是判定规则落地后要填的位置，
-None=尚未判定；报告渲染（_render_claims）已经按 verdict 优先、None 时
-退回现状按 status 渲染的规则升级好——接线全部就绪，只等规则本体。
+Citation checks compare source coordinates and exact snippets. Semantic
+support is not judged in this release; reports label that limit explicitly.
 """
 
+import argparse
+import html
 import operator
 import re
 import sys
 from pathlib import Path
-from typing import Annotated, TypedDict
+from typing import Annotated, Literal, TypedDict
 
+from httpx import TransportError
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langfuse import get_client
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
-from pydantic import BaseModel, ConfigDict, Field
+from openai import APIError
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from repo_audit import config
 from repo_audit.repo_tools import (
     PathEscapeError,
     _resolve_within,
-    grep_repo as _grep_repo,
-    read_file as _read_file,
     repo_stats,
+)
+from repo_audit.repo_tools import (
+    grep_repo as _grep_repo,
+)
+from repo_audit.repo_tools import (
+    read_file as _read_file,
+)
+from repo_audit.repo_tools import (
     repo_tree as _repo_tree,
 )
-
 
 # ──────────────────────────────────────────────────────────────
 # 数据结构
 # ──────────────────────────────────────────────────────────────
+
+_NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
 
 class SubTask(BaseModel):
     """Planner 拆出的一个可并行、自包含的子任务（草案 §1.2）。
@@ -84,41 +51,41 @@ class SubTask(BaseModel):
     的对象"，因为 Worker 现在要知道去哪块代码查，而不是拿一句话满仓库乱翻。
     """
 
-    target_module: str        # 该子任务聚焦的目录/模块/文件（从目录树里挑）
-    questions: list[str]      # 1~3 个"读这块代码就能回答"的具体问题
+    target_module: _NonBlank  # 该子任务聚焦的目录/模块/文件（从目录树里挑）
+    questions: list[_NonBlank] = Field(min_length=1, max_length=3)
     # v1 先不加 question_type 字段——本周没有消费方（Verifier 不看它、报告
     # 不按它分组），没有消费方的字段就是负债，见草案 §1.4 末段。
 
 
 class Plan(BaseModel):
     subtasks: list[SubTask] = Field(
-        description="3~8 个可并行、独立调研的子任务；仓库过小可酌减，不许注水凑数"
+        min_length=1, max_length=8,
+        description="1~8 个可并行、独立调研的子任务；仓库过小可酌减，不许注水凑数",
     )
 
 
 class Citation(BaseModel):
-    """一条引用坐标：不只是给人看的出处，是 Verifier 回读源码独立核验的
-    唯一依据（草案 §0.5；管道接线见 _judge_claim，判定规则待 D3 定案）。"""
+    """Source coordinates and the exact excerpt supplied by a worker."""
 
-    file: str          # 仓库相对路径，逐字取自工具输出，禁止臆造
-    line_start: int    # 取自 read_file 的行号——没读过就没有行号可填
+    file: str
+    line_start: int
     line_end: int
-    snippet: str       # 从带行号输出里逐字摘录的关键几行（不转述、不改写）
+    snippet: str
 
 
 class ClaimDraft(BaseModel):
-    """Worker 模型输出的结构化结果（走 function_calling）。只含模型该填的
-    字段，不含 worker_id/target_module 这类运行时才知道的追踪字段——沿用
-    消费版 `_SourcedFinding`（模型出）与 `Evidence`（运行时装配加 worker_id）
-    分离的做法，见草案 §1.2 末段。"""
+    """Worker supplied data. Verification fields are never accepted here."""
 
-    statement: str
-    # 故意用 str 而不是 Literal["supported","insufficient"]：function_calling
-    # 下枚举约束不稳，取值改由提示词正文里的铁律兜死（belt-and-suspenders，
-    # 草案 §2.2/§2.4）。Worker 只有两值——"说错了"(refuted) 只有独立核验的
-    # Verifier 判得出，Worker 判不了自己的话是不是错的（会偏袒自己）。
-    status: str
-    citations: list[Citation] = []  # supported 时 ≥1 条；insufficient 时留空
+    model_config = ConfigDict(extra="forbid")
+    statement: _NonBlank
+    status: Literal["supported", "insufficient"]
+    citations: list[Citation] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def supported_needs_citation(self):
+        if self.status == "supported" and not self.citations:
+            raise ValueError("supported claim requires at least one citation")
+        return self
 
 
 class WorkerOutput(BaseModel):
@@ -128,32 +95,18 @@ class WorkerOutput(BaseModel):
 
 
 class Claim(ClaimDraft):
-    """运行时装配版：ClaimDraft 的字段 + worker_id + target_module。这两个
-    追踪字段来自 Send 载荷，不是模型输出——用继承而不是重复声明三个字段，
-    精确表达"Claim 是 ClaimDraft 加了追踪信息"这层关系，不是两个平行的
-    独立结构（对照消费版 Evidence 在 _SourcedFinding 基础上加 worker_id
-    的同一个模式）。
+    """Worker claim with runtime provenance and independent citation state.
 
-    verdict（D3 新增）：Verifier 的独立核验结论。None=尚未核验——今晚：管道
-    已经接好，但 _judge_claim 的判定规则本体待 Ziyang 定案（见该函数
-    docstring）；规则落地后取值 supported/refuted/insufficient。
-
-    verdict 与 status 不是同一件事的两个名字，是两个不同评判者的话（草案
-    §2.4 问 3）：
-    - status 是 Worker 的自述——"我自认有引用支撑"，写这条结论的模型自己
-      填的，天然会偏袒自己，判不出自己"说错了"（refuted 这个值 Worker
-      根本给不出，只有两值 supported/insufficient）；
-    - verdict 是 Verifier 回读 file:line 之后的独立复核——"这几行代码是否
-      真的支持这句话"，评判者换成了没写过这条结论的第三方，才有资格判
-      refuted。
-    两者语义不同，不能合并成一个字段：报告渲染（_render_claims）以 verdict
-    优先——有核验结论就按核验结论说话，verdict 是 None（未核验）时才退回
-    现状按 status 渲染，这也是"Verifier 关闭时输出必须与今天完全一致"这条
-    验收标准在数据结构上的体现。
+    status is a worker self-report. citation_status checks source coordinates and
+    exact text only. verdict is reserved for a future semantic judge and remains
+    None in this deterministic release.
     """
 
     worker_id: str
     target_module: str
+    worker_error: str | None = None
+    citation_status: Literal["unchecked", "valid", "invalid", "missing", "unavailable"] = "unchecked"
+    citation_reason: str | None = None
     verdict: str | None = None
 
 
@@ -206,13 +159,15 @@ def _readme_head(root: Path, *, max_lines: int = 60, max_chars: int = 2000) -> s
     """
     for name in ("README.md", "README.rst"):
         path = root / name
-        if path.is_file():
+        if not path.is_symlink() and path.is_file():
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
             return "\n".join(lines[:max_lines])[:max_chars]
     return "（无 README）"
 
 
-PLANNER_PROMPT = """你是代码库调研的规划者。你面前只有一个陌生仓库的「地图」——统计信息、浅层目录树、README 开头——你的唯一职责是把「读懂这个仓库」拆成 3~8 个可以并行、独立调研的子任务，交给下游的 Worker 逐个去代码里取证。
+PLANNER_PROMPT = """你是代码库调研的规划者。你面前只有一个陌生仓库的「地图」——统计信息、浅层目录树、README 开头——你的职责是围绕用户问题拆出可以并行、独立调研的子任务，交给下游的 Worker 逐个去代码里取证。
+
+用户问题：{question}
 
 严格约束：
 - 你只做拆解，不做回答。你看不到文件正文，任何结论都不该由你给出——读代码下结论是 Worker 的活。
@@ -231,7 +186,7 @@ PLANNER_PROMPT = """你是代码库调研的规划者。你面前只有一个陌
 - target_module：该子任务落在哪个目录/模块/文件（从上面的目录树里挑；拿不准就填最相关的顶层目录，别填一个树里没有的路径）
 - questions：1~3 个"读这块代码就能回答"的具体问题。要能被 file:行号 回答，别问"介绍一下 X"这种泛问。
 
-数量：目标 3~8 个。仓库很小就少拆几个（宁少毋凑）；很大也别超 8——把同一模块的问题合并成一条。
+数量：1~8 个。按用户问题所需范围拆分，仓库很小就少拆几个（宁少毋凑）；很大也别超 8——把同一模块的问题合并成一条。
 
 ──────── 仓库地图 ────────
 [统计]
@@ -245,10 +200,13 @@ PLANNER_PROMPT = """你是代码库调研的规划者。你面前只有一个陌
 
 
 def planner(state: State) -> dict:
-    """把「读懂这个仓库」拆成 3~8 个可并行调研的子任务（旗舰档：拆解质量
+    """围绕用户问题拆成 1~8 个可并行调研的子任务（旗舰档：拆解质量
     决定全局，草案 §1.4）。"""
+    question = state.get("question")
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question must be a nonblank string")
     tier = config.try_flagship_tier()
-    if tier is None:  # 假数据模式（D6）：结构与真路径完全一致，CI 无密钥照跑
+    if tier is None:  # Explicit demo mode only.
         return {
             "subtasks": [
                 SubTask(
@@ -260,6 +218,7 @@ def planner(state: State) -> dict:
         }
     root = Path(state["repo_root"])
     prompt = PLANNER_PROMPT.format(
+        question=question,
         repo_stats=repo_stats(root).render(),
         tree=_repo_tree(root, 2),
         readme_head=_readme_head(root),
@@ -269,7 +228,7 @@ def planner(state: State) -> dict:
     # BATTLE_LOG 2026-07-03），用两家都兼容的工具调用协议取结构化输出。
     # 这条不许改——踩过一次真故障。
     llm = tier.client(temperature=0).with_structured_output(Plan, method="function_calling")
-    plan = llm.invoke(prompt)
+    plan = Plan.model_validate(llm.invoke(prompt))
     return {"subtasks": plan.subtasks}
 
 
@@ -442,7 +401,7 @@ def _fake_claims(task: WorkerInput) -> list[Claim]:
 
 
 def _handle_tool_calls(
-    ai_msg, tool_map: dict, messages: list, query_calls: int
+    ai_msg, tool_map: dict, messages: list, query_calls: int, *, allow_queries: bool = True
 ) -> tuple[WorkerOutput | None, int]:
     """执行一轮 AI 消息里的全部 tool_calls，把结果回填成 ToolMessage。
 
@@ -471,8 +430,8 @@ def _handle_tool_calls(
     for invalid in ai_msg.invalid_tool_calls:
         if invalid.get("id") is None:
             continue  # 极端情况下连 id 都没有，没法定向回复给哪条调用，只能跳过
-        if invalid.get("name") in _QUERY_TOOL_NAMES:
-            query_calls += 1
+        if invalid.get("name") != "submit_claims":
+            query_calls = min(MAX_QUERY_CALLS, query_calls + 1)
         messages.append(
             ToolMessage(
                 content=f"调用解析失败（参数不是合法 JSON）：{invalid.get('error')}；请重新调用，"
@@ -485,20 +444,37 @@ def _handle_tool_calls(
         name = tool_call["name"]
         if name == "submit_claims":
             try:
-                output = WorkerOutput.model_validate(tool_call["args"])
+                submitted = WorkerOutput.model_validate(tool_call["args"])
             except Exception as exc:  # noqa: BLE001 — 参数形状不对，回错让模型自己改，不崩
                 messages.append(
                     ToolMessage(content=f"提交失败，参数不合法：{exc}", tool_call_id=tool_call["id"])
                 )
                 continue
+            if output is None:
+                output = submitted
             messages.append(ToolMessage(content="已收到", tool_call_id=tool_call["id"]))
             continue
 
-        if name in _QUERY_TOOL_NAMES:
-            query_calls += 1
+        budget_available = query_calls < MAX_QUERY_CALLS
+        query_calls = min(MAX_QUERY_CALLS, query_calls + 1)
+        if name not in _QUERY_TOOL_NAMES or name not in tool_map:
+            messages.append(
+                ToolMessage(content=f"未知工具：{name}", tool_call_id=tool_call["id"])
+            )
+            continue
+        if not allow_queries:
+            messages.append(
+                ToolMessage(content="交卷阶段不可调用查证工具", tool_call_id=tool_call["id"])
+            )
+            continue
+        if not budget_available:
+            messages.append(
+                ToolMessage(content="查证工具预算已用尽", tool_call_id=tool_call["id"])
+            )
+            continue
         try:
             result = tool_map[name].invoke(tool_call["args"])
-        except (PathEscapeError, ValueError, FileNotFoundError) as exc:
+        except (PathEscapeError, ValueError, OSError) as exc:
             # 铁律 3/6 的下游消费方式：工具异常不是致命错误，是模型给错了
             # 参数（越界路径/非法正则/文件不存在），把错误文本原样回给
             # 模型自己调整，绝不让整个 Worker 崩掉。
@@ -506,6 +482,22 @@ def _handle_tool_calls(
         messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
 
     return output, query_calls
+
+
+def _provider_failure_claims(task: WorkerInput, exc: APIError | TransportError) -> list[Claim]:
+    """Keep a failed worker in the report without exposing provider error text."""
+    subtask = task["subtask"]
+    return [
+        Claim(
+            statement=f"证据不足：{question}（模型调用失败：{type(exc).__name__}）",
+            status="insufficient",
+            citations=[],
+            worker_id=task["worker_id"],
+            target_module=subtask.target_module,
+            worker_error=type(exc).__name__,
+        )
+        for question in subtask.questions
+    ]
 
 
 def worker(task: WorkerInput) -> dict:
@@ -520,7 +512,7 @@ def worker(task: WorkerInput) -> dict:
     """
     subtask = task["subtask"]
     tier = config.try_cheap_tier()
-    if tier is None:  # 假数据模式（D6）
+    if tier is None:  # Explicit demo mode only.
         return {"claims": _fake_claims(task)}
 
     root = Path(task["repo_root"])
@@ -552,7 +544,10 @@ def worker(task: WorkerInput) -> dict:
 
     while output is None and query_calls < MAX_QUERY_CALLS and rounds < max_rounds:
         rounds += 1
-        ai_msg = llm.invoke(messages)
+        try:
+            ai_msg = llm.invoke(messages)
+        except (APIError, TransportError) as exc:
+            return {"claims": _provider_failure_claims(task, exc)}
         messages.append(ai_msg)
         if not ai_msg.tool_calls and not ai_msg.invalid_tool_calls:
             break  # 模型放弃了工具协议、直接吐了段文字——没什么好等的，进强制交卷
@@ -600,16 +595,23 @@ def worker(task: WorkerInput) -> dict:
             )
         )
         submit_only = [tool_map["submit_claims"]]
+        last_provider_error = None
         for choice in ("submit_claims", "auto"):
             forced_llm = base_llm.bind_tools(submit_only, tool_choice=choice)
             try:
                 ai_msg = forced_llm.invoke(messages)
-            except Exception:  # noqa: BLE001 — 供应商不认这个 tool_choice 形态：换下一档，不崩
+            except (APIError, TransportError) as exc:
+                last_provider_error = exc
                 continue
+            last_provider_error = None
             messages.append(ai_msg)
-            output, _ = _handle_tool_calls(ai_msg, tool_map, messages, query_calls)
+            output, _ = _handle_tool_calls(
+                ai_msg, tool_map, messages, query_calls, allow_queries=False
+            )
             if output is not None:
                 break
+        if output is None and last_provider_error is not None:
+            return {"claims": _provider_failure_claims(task, last_provider_error)}
 
     if output is None:
         # 强制那一轮仍没拿到合法结构化输出（模型没配合协议/参数校验失败）
@@ -636,112 +638,95 @@ def worker(task: WorkerInput) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
-# 节点：Verifier（D3：管道已接，判定规则本体待定案）
+# 节点：Verifier（确定性引用检查）
 # ──────────────────────────────────────────────────────────────
 
-def _judge_claim(root: Path, claim: Claim) -> str:
-    """规则接缝（D3 红线）：Verifier"什么算 supported、refuted/insufficient
-    的判定界线"是 Ziyang 本人的判断题，今晚绝不实现（见方案 D3、分工红线
-    §3）。今晚只落地这道判断题上游、无争议的一段——存在性检查：citation
-    指向的位置是否真实存在。这不是待决策的判断题，是纯粹的事实核验：引用
-    一个根本不存在的 file/行区间，不需要理解任何语义就能确定是编造的。
+def _snippet_matches(citation: Citation, lines: list[str]) -> bool:
+    """Accept literal source, or complete read_file rows at their stated lines."""
+    if not citation.snippet.strip():
+        return False
+    source = "\n".join(lines[citation.line_start - 1:citation.line_end])
+    if citation.snippet in source:
+        return True
 
-    对 claim.citations 里的每一条，依次检查三件事，任何一步失败都直接可以
-    确定这条引用是假的、整条 claim 判 "refuted"（对照工具层 read_file 的
-    docstring："行号格式必须严格对齐...行号错一位，引用就是假的"——这里是
-    同一个原则在核验层的落地）：
-      1. file 在 root 内真实存在——复用 _resolve_within 同一份护栏（工具层
-         用它挡模型的路径穿越，这里用它挡"file 字段是模型编的，仓库里根本
-         没有这个路径"，两个消费方共用一份实现，不重新发明）；
-      2. line_start/line_end 落在文件真实行数范围内——这一步必须自己算
-         total_lines 再比较，不能靠 read_file 的返回值反推：read_file 对
-         越界的 start/end 是**静默 clamp**（lo=max(1,start)、
-         hi=min(total,end)），不是报错，如果只看 read_file 能不能读出内容,
-         一个声称"第 99999 行"、实际被 clamp 到文件末尾的假引用会被误判成
-         "读到内容了=真的"——所以行区间必须用真实 total_lines 单独校验；
-      3. 用 read_file 真读一次，内容非空——上面两条是"数字对不对"的静态
-         检查，这一步是"真的能读出东西来"的动态确认，复用与 Worker 完全
-         同一个 read_file，核验用的是 Worker 当初本该用的同一份唯一依据。
+    previous = None
+    excerpts = []
+    for row in citation.snippet.split("\n"):
+        prefix, separator, excerpt = row.partition("\t")
+        try:
+            number = int(prefix)
+        except ValueError:
+            return False
+        if (
+            not separator
+            or prefix != f"{number:>6}"
+            or not citation.line_start <= number <= citation.line_end
+            or (previous is not None and number != previous + 1)
+            or excerpt != lines[number - 1]
+        ):
+            return False
+        previous = number
+        excerpts.append(excerpt)
+    return bool("\n".join(excerpts).strip())
 
-    citations 为空时（典型情况：claim.status == "insufficient"，Worker 自己
-    都没声称有证据）上面的循环一次都不会进入，直接落到下面同一个
-    NotImplementedError——这不是本函数在替 Verifier 判"insufficient 该不该
-    有 verdict"，只是循环在空列表上的自然结果；调用方 verifier() 对这类
-    claim 会捕获同一个异常、verdict 保持 None，效果等价于"跳过"，但不是靠
-    这里的一条 if 提前拍板"这类结论不需要核验"。
 
-    存在性检查全部通过之后——即"引用的位置是真的"——再往下判"这几行代码的
-    内容是否真的支持 statement 这句话"（语义匹配）才是待决策的判断题本体，
-    今晚绝不实现，用抛异常代替沉默地瞎猜。
+def _judge_claim(
+    root: Path, claim: Claim, cache: dict[Path, tuple[list[str] | None, str | None]] | None = None,
+) -> tuple[Literal["valid", "invalid", "missing", "unavailable"], str | None]:
+    """Check every citation against one source snapshot per file.
+
+    Aggregation is all-or-nothing: any invalid citation makes the claim's
+    citation state invalid. Read errors are unavailable, never semantic refutation.
     """
+    if not claim.citations:
+        return "missing", "no citations supplied"
+    if cache is None:
+        cache = {}
+    failures: list[tuple[str, str]] = []
     for c in claim.citations:
         try:
             path = _resolve_within(root, c.file)
-        except PathEscapeError:
-            return "refuted"  # file 字段是越界路径——不可能是真实引用
-        if not path.is_file():
-            return "refuted"  # 引用的位置在仓库里根本不存在
-        try:
-            source_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            return "refuted"  # 读不出来（权限/损坏等）——无法确认引用真实存在，保守判假
-        total_lines = len(source_lines)
-        if not (1 <= c.line_start <= c.line_end <= total_lines):
-            return "refuted"  # 行区间超出文件真实行数（或本身首尾颠倒），必然编造
-        content = _read_file(root, c.file, c.line_start, c.line_end)
-        if not content.strip():
-            return "refuted"  # 声称有内容，实际读出来是空的
-        # read_file 的输出带行号；Worker 有时连行号一起摘录。去掉这个展示前缀，
-        # 再与引用区间内的真实源码逐字比对，避免正确坐标搭配编造的片段。
-        snippet = re.sub(r"(?m)^\s*\d+\t", "", c.snippet).strip()
-        cited_source = "\n".join(source_lines[c.line_start - 1 : c.line_end])
-        if not snippet or snippet not in cited_source:
-            return "refuted"
-
-    raise NotImplementedError("判定规则待 Ziyang 五道决策题定案后落地——见方案 D3")
+        except (PathEscapeError, OSError, ValueError):
+            failures.append(("invalid", f"path outside repository: {c.file}"))
+            continue
+        if path not in cache:
+            try:
+                if not path.is_file():
+                    cache[path] = (None, "file does not exist")
+                else:
+                    cache[path] = (path.read_text(encoding="utf-8", errors="replace").splitlines(), None)
+            except OSError as exc:
+                cache[path] = (None, f"source unreadable: {exc}")
+        lines, error = cache[path]
+        if error:
+            kind = "unavailable" if error.startswith("source unreadable") else "invalid"
+            failures.append((kind, f"{c.file}: {error}"))
+            continue
+        assert lines is not None
+        if not 1 <= c.line_start <= c.line_end <= len(lines):
+            failures.append(("invalid", f"{c.file}: invalid line range"))
+            continue
+        if not _snippet_matches(c, lines):
+            failures.append(("invalid", f"{c.file}: snippet differs from source"))
+    if failures:
+        return next(((kind, reason) for kind, reason in failures if kind == "invalid"), failures[0])
+    return "valid", None
 
 
 def verifier(state: State) -> dict:
-    """核验层（D3 管道接线；判定规则本体见 _judge_claim）。静态边——接在
-    worker 与 synthesizer 之间，不需要 Send：worker 的 Send 扇入在这一步
-    之前已经完成（claims 已是聚合好的完整列表），verifier 只是对这份已知
-    长度的列表做一次遍历判定，没有"运行时才知道要派几个"的动态并行需求。
-
-    为什么产出写进新字段 verified_claims、而不是直接覆盖 claims：见 State
-    的 docstring——claims 的 reducer 是 operator.add，这里如果也返回
-    {"claims": ...}，会被拼接而不是替换，产生重复结论。verified_claims
-    无 reducer、整体覆盖，一次性替换，才是这里真正需要的语义。
-
-    开关（config.verifier_enabled()，默认关）：
-    - 关闭：原样透传，不新建对象——verified_claims 与 claims 逐字一致
-      （verdict 是 Claim 的默认值 None）。今天（开关默认关闭）的报告产出
-      必须与还没有这一层完全相同，这是验收标准，不是顺带的优化。
-    - 打开：对 claims 里每一条都调 _judge_claim(root, claim)，不按 status
-      提前筛掉 insufficient 的那些——"要不要理会一条自称没证据的结论"本身
-      已经贴着"什么算需要核验的结论"这道红线，今晚不替 Ziyang 拍板；
-      insufficient 的空 citations 列表在 _judge_claim 里自然是"零次循环、
-      无失败"，照样落到同一个 NotImplementedError，被下面同一个 except
-      捕获成 verdict=None——效果等价于"跳过"，但不是这里的一条 if 替它
-      判了"不需要核验"，是规则函数自己在空输入上的诚实结果。
-
-    _judge_claim 抛 NotImplementedError 是预期行为、不是 bug：今晚只落地了
-    存在性检查这一段判定规则，凡是存在性检查通过（或没有引用可查）、需要
-    继续往下判语义的 claim 都会走到这里——捕获后 verdict 置 None，保证
-    开关误打开也不会崩掉整个 run；报告渲染层（_render_claims）看到 verdict
-    is None 时会按现状用 status 渲染，行为上和"还没有 Verifier"完全一样
-    安全。
-    """
+    """Populate citation evidence independently of worker status and semantics."""
     if not config.verifier_enabled():
-        return {"verified_claims": state["claims"]}
-
+        return {"verified_claims": [c.model_copy(update={
+            "citation_status": "unchecked", "citation_reason": "verifier disabled", "verdict": None,
+        }) for c in state["claims"]]}
     root = Path(state["repo_root"])
-    verified: list[Claim] = []
+    cache: dict[Path, tuple[list[str] | None, str | None]] = {}
+    verified = []
     for claim in state["claims"]:
-        try:
-            verdict = _judge_claim(root, claim)
-        except NotImplementedError:
-            verdict = None
-        verified.append(claim.model_copy(update={"verdict": verdict}))
+        citation_status, citation_reason = _judge_claim(root, claim, cache)
+        verified.append(claim.model_copy(update={
+            "citation_status": citation_status, "citation_reason": citation_reason, "verdict": None,
+        }))
     return {"verified_claims": verified}
 
 
@@ -749,100 +734,49 @@ def verifier(state: State) -> dict:
 # 节点：Synthesizer
 # ──────────────────────────────────────────────────────────────
 
-SYNTH_PROMPT = """你是代码库调研报告的撰写者。基于下面这份已经按 Worker 结论整理好的清单，\
-针对用户的调研问题写一份结论先行的调研报告。
-
-要求：
-- 结论先行：开头先直接回答用户的问题，再展开支撑细节。
-- 保留清单里每条结论后面的 [n] 引用编号，不要丢掉、也不要重新编号。
-- 标了"存疑：证据不足"的结论要原样保留这个标注，不要把它写成已证实的结论；也不要因为它存在就回避给出整体结论。
-- 不要在清单之外编造任何结论或引用；不同结论之间如果矛盾，如实指出矛盾，不要含糊调和。
-
-用户的调研问题：{question}
-
-Worker 结论清单：
-{claims}"""
+def _report_text(value: str) -> str:
+    """Keep external text on one line, with HTML and inline Markdown inert."""
+    text = " ".join(value.split())
+    return html.escape(re.sub(r"([\\`*_{}\[\]()#+!|~])", r"\\\1", text))
 
 
 def _render_claims(claims: list[Claim]) -> tuple[str, str]:
-    """把 Claim 列表渲染成两块文本，供 synthesizer 的真假两条路径共用：
-
-    - claims_block：编号结论清单，既是喂给 Synthesizer 提示词的 {claims}
-      占位符内容，也是假数据模式下报告正文本身。每条的措辞在这一步就由
-      代码写死，不指望 LLM 自己判断每条状态该怎么措辞——LLM 只需要在已经
-      标好状态的清单基础上组织行文。
-    - citations_block：报告末尾的引用清单，每条渲染成 "[n] file:L起-L止"，
-      与 claims_block 里的 [n] 共用同一套编号，读者从结论跳引用不需要
-      换算。这一块无论真旗舰档路径还是假数据路径都由代码直接拼出来、不
-      经过 LLM 复述——引用格式的正确性不能赌 LLM 会不会抄对，必须由代码
-      兜底保证（呼应 D3"证据是结构化对象、不是文本"）。
-
-    D3 升级：渲染以 verdict 优先于 status（三分支，按优先级判断"这条该不
-    该按支持渲染"）：
-    - verdict == "refuted"：Worker 曾自称 supported，但 Verifier 回读引用
-      没能核实——这与"Worker 自己就说证据不足"是完全不同的两种情况，必须
-      让读者一眼看出"这条曾经自称有证据、核验没过"，不能和天然的
-      insufficient 混进同一种"存疑"措辞里，单独给一种"已核验驳回"样式；
-      驳回的引用不进入 citations_block——把没通过核验的引用继续挂进"可
-      信引用清单"是危险方向，宁可读者觉得"这条没有引用可查"。
-    - verdict == "supported"：Verifier 独立复核通过，按支持结论正常渲染
-      （今晚 _judge_claim 还不会真的产出这个值——语义判定明天才定案——这
-      条分支是为规则本体落地后预留，不是死代码）。
-    - verdict is None（未核验：含 Verifier 关闭、或还没轮到判定规则那一
-      步）：退回升级前的现状——`status == "supported" and citations` 才
-      按支持渲染，哪怕模型把 status 字符串写偏了、或者写了 supported 但
-      没带 citations，也一律按"存疑"渲染，保守是安全的方向。
-    - 其余取值（如 "insufficient"，_judge_claim 今晚不会产出，为字段的
-      三值定义预留）：同样按"存疑"保守渲染，未知的 verdict 取值不该被
-      当成"已证实"处理。
-    """
+    """Deterministically label claims; number only citation-valid references."""
     claim_lines: list[str] = []
     citation_lines: list[str] = []
-    n = 0
+    labels = {
+        "valid": "引用有效，语义未核验",
+        "invalid": "引用无效，语义未核验",
+        "missing": "缺少引用，语义未核验",
+        "unavailable": "引用无法读取，语义未核验",
+        "unchecked": "引用未核验，语义未核验",
+    }
     for claim in claims:
-        if claim.verdict == "refuted":
-            claim_lines.append(
-                f"- 已核验驳回 —— {claim.statement}"
-                f"（Worker 曾自称 supported，但引用未通过 Verifier 核验；{claim.target_module}）"
-            )
-            continue
-
-        if claim.verdict == "supported":
-            is_supported = True
-        elif claim.verdict is None:
-            is_supported = claim.status == "supported" and bool(claim.citations)
-        else:
-            is_supported = False  # 预留：insufficient 等未来取值一律按"存疑"保守渲染
-
-        if is_supported:
-            marks = []
+        label = labels[claim.citation_status]
+        if claim.status == "insufficient" or claim.verdict == "refuted":
+            label += "；存疑：证据不足"
+        marks = []
+        if claim.citation_status == "valid":
             for c in claim.citations:
-                n += 1
+                n = len(citation_lines) + 1
                 marks.append(f"[{n}]")
-                citation_lines.append(f"[{n}] {c.file}:L{c.line_start}-{c.line_end}")
-            claim_lines.append(f"- {claim.statement} {''.join(marks)}（{claim.target_module}）")
-        else:
-            claim_lines.append(f"- 存疑：证据不足 —— {claim.statement}（{claim.target_module}）")
-    body = "\n".join(claim_lines) if claim_lines else "（无结论）"
-    return body, "\n".join(citation_lines)
+                citation_lines.append(f"[{n}] {_report_text(c.file)}:L{c.line_start}-{c.line_end}")
+        claim_lines.append(
+            f"- {label} —— {_report_text(claim.statement)} {''.join(marks)}"
+            f"（{_report_text(claim.target_module)}）"
+        )
+    return "\n".join(claim_lines) if claim_lines else "（无结论）", "\n".join(citation_lines)
 
 
 def synthesizer(state: State) -> dict:
-    """把全部 Worker 产出的 Claim 合成一份带引用的调研报告（旗舰档：最终
-    质量门面）。读 verified_claims（verifier 的产出）而不是 claims（Worker
-    的原始产出）——开关关闭时两者逐字一致，开关打开时前者带了 verdict。"""
-    claims_block, citations_block = _render_claims(state["verified_claims"])
-    tier = config.try_flagship_tier()
-    if tier is None:  # 假数据模式：不调用任何 LLM，报告正文就是渲染好的结论清单
-        body = claims_block
-    else:
-        msg = tier.client(temperature=0).invoke(
-            SYNTH_PROMPT.format(question=state["question"], claims=claims_block)
-        )
-        body = msg.content
-    report = f"# 代码库调研报告：{state['question']}\n\n{body}"
-    if citations_block:
-        report += f"\n\n---\n引用清单：\n{citations_block}"
+    """Compose a report from verified_claims without a model rewrite."""
+    body, citations = _render_claims(state["verified_claims"])
+    report = (
+        f"# 代码库调研报告：{_report_text(state['question'])}\n\n"
+        f"语义未核验；以下仅检查引用与源码是否一致。\n\n{body}"
+    )
+    if citations:
+        report += f"\n\n---\n引用清单：\n{citations}"
     return {"report": report}
 
 
@@ -866,40 +800,39 @@ def build_graph():
     return g.compile()
 
 
-if __name__ == "__main__":
-    # 用法：python -m repo_audit.graph <repo_path> "问题"
-    # 不给参数时的默认示例改成对本仓库自身提问——不必配置任何外部路径，
-    # clone 下来就能立刻看到一次真实的端到端产出（D6"零配置先看到骨架跑
-    # 起来"的延伸：零配置也能跑一次真实提问，而不只是看到假数据）。
-    _default_root = Path(__file__).resolve().parents[2]
-    repo_root = sys.argv[1] if len(sys.argv) >= 2 else str(_default_root)
-    question = (
-        " ".join(sys.argv[2:])
-        if len(sys.argv) >= 3
-        else "这个仓库的整体架构是怎样的？分几层，各层职责是什么？"
-    )
-    # T8：Langfuse 观测埋点。无密钥时 langfuse_handler() 返回 None——不传
-    # callbacks，invoke() 与接入前完全一样，零副作用（设计说明见
-    # config.langfuse_handler）。有密钥时把 handler 通过 LangGraph 的
-    # RunnableConfig 传进去：LangGraph 会把这一个 callback 自动传播到图内
-    # 全部节点（含 fan_out 用 Send 动态派发出的每个并行 worker）产生的每一次
-    # LLM 调用上，不需要在 planner/worker/synthesizer 三个节点里各自手动埋点。
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Audit a repository with cited evidence")
+    parser.add_argument("--demo", action="store_true", help="run with fabricated sample claims")
+    parser.add_argument("repo", nargs="?", default=str(Path(__file__).resolve().parents[2]))
+    parser.add_argument("question", nargs="*", help="natural-language repository question")
+    args = parser.parse_args(argv)
+    if args.demo:
+        import os
+
+        os.environ["REPO_AUDIT_MODE"] = "demo"
+    root = Path(args.repo).resolve()
+    if not root.is_dir():
+        parser.error(f"repository path is not a directory: {root}")
+    question = " ".join(args.question) if args.question else "这个仓库的整体架构是怎样的？"
+    if not question.strip():
+        parser.error("question must be nonblank")
+    try:
+        config.try_flagship_tier()  # validates both real tiers before graph/model calls
+    except (RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+
     handler = config.langfuse_handler()
     invoke_kwargs = {"config": {"callbacks": [handler]}} if handler is not None else {}
     try:
         result = build_graph().invoke(
-            {"question": question, "repo_root": repo_root}, **invoke_kwargs
+            {"question": question, "repo_root": str(root)}, **invoke_kwargs
         )
         print(result["report"])
+        return 0
     finally:
-        # 短脚本进程退出前必须显式收尾：Langfuse 4.x 是批量异步上报，不
-        # flush 就让进程退出，缓冲区里还没发出去的 trace 会直接丢失。放在
-        # finally 而不是紧跟在 invoke() 后面，是为了 invoke() 本身抛异常时
-        # 也能把已经产生的 trace 发出去——报错的这次调用恰恰是最需要观测
-        # 数据排查的一次，不能因为进程要退出就先丢了它。用 shutdown() 而
-        # 不是 flush()：这是进程退出前的最后一步，shutdown() 在 flush 之后
-        # 顺带把后台上报线程也干净收掉，比只 flush 更贴合"马上要退出"这个
-        # 场景（get_client() 拿到的是 CallbackHandler 内部同一个单例，见
-        # langfuse.get_client 源码里的 LangfuseResourceManager 单例表）。
         if handler is not None:
             get_client().shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
