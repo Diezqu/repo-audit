@@ -98,7 +98,7 @@ def _make_claim(
     """测试用最小 Claim 工厂——D3 新增的测试大多只关心 citations/verdict，
     其余字段给个能用的默认值，减少每个用例里的重复样板。"""
     if citations is None:
-        citations = [Citation(file=file, line_start=line_start, line_end=line_end, snippet="x")]
+        citations = [Citation(file=file, line_start=line_start, line_end=line_end, snippet="line1")]
     return Claim(
         statement="s", status=status, citations=citations,
         worker_id="worker_1", target_module="m", verdict=verdict,
@@ -189,6 +189,28 @@ def test_judge_claim_out_of_range_lines_is_refuted(tmp_path):
     (tmp_path / "a.py").write_text("line1\nline2\n")
     claim = _make_claim(file="a.py", line_start=1, line_end=99)
     assert _judge_claim(tmp_path, claim) == "refuted"
+
+
+def test_judge_claim_refutes_snippet_missing_from_cited_lines(tmp_path):
+    (tmp_path / "a.py").write_text("alpha = 1\nbeta = 2\n")
+    claim = _make_claim(file="a.py", line_start=1, line_end=1)
+    claim.citations[0].snippet = "beta = 2"
+    assert _judge_claim(tmp_path, claim) == "refuted"
+
+
+def test_judge_claim_refutes_empty_snippet(tmp_path):
+    (tmp_path / "a.py").write_text("alpha = 1\n")
+    claim = _make_claim(file="a.py", line_start=1, line_end=1)
+    claim.citations[0].snippet = "   "
+    assert _judge_claim(tmp_path, claim) == "refuted"
+
+
+def test_judge_claim_accepts_read_file_numbered_snippet_for_further_review(tmp_path):
+    (tmp_path / "a.py").write_text("line1\nline2\n")
+    claim = _make_claim(file="a.py", line_start=1, line_end=1)
+    claim.citations[0].snippet = "     1\tline1"
+    with pytest.raises(NotImplementedError):
+        _judge_claim(tmp_path, claim)
 
 
 def test_judge_claim_reversed_range_is_refuted(tmp_path):

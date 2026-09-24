@@ -50,6 +50,7 @@ None=尚未判定；报告渲染（_render_claims）已经按 verdict 优先、N
 """
 
 import operator
+import re
 import sys
 from pathlib import Path
 from typing import Annotated, TypedDict
@@ -681,14 +682,21 @@ def _judge_claim(root: Path, claim: Claim) -> str:
         if not path.is_file():
             return "refuted"  # 引用的位置在仓库里根本不存在
         try:
-            total_lines = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            source_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             return "refuted"  # 读不出来（权限/损坏等）——无法确认引用真实存在，保守判假
+        total_lines = len(source_lines)
         if not (1 <= c.line_start <= c.line_end <= total_lines):
             return "refuted"  # 行区间超出文件真实行数（或本身首尾颠倒），必然编造
         content = _read_file(root, c.file, c.line_start, c.line_end)
         if not content.strip():
             return "refuted"  # 声称有内容，实际读出来是空的
+        # read_file 的输出带行号；Worker 有时连行号一起摘录。去掉这个展示前缀，
+        # 再与引用区间内的真实源码逐字比对，避免正确坐标搭配编造的片段。
+        snippet = re.sub(r"(?m)^\s*\d+\t", "", c.snippet).strip()
+        cited_source = "\n".join(source_lines[c.line_start - 1 : c.line_end])
+        if not snippet or snippet not in cited_source:
+            return "refuted"
 
     raise NotImplementedError("判定规则待 Ziyang 五道决策题定案后落地——见方案 D3")
 
