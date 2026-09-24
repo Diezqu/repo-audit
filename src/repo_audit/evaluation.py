@@ -65,6 +65,9 @@ def validate_corpus(
     records: list[dict], repo_root: Path, *, expected_commit: str = PINNED_COMMIT
 ) -> dict:
     """Check all draft references against the exact clean Git checkout."""
+    repo_root = Path(repo_root).resolve()
+    if Path(_git(repo_root, "rev-parse", "--show-toplevel")).resolve() != repo_root:
+        raise ValueError("Source --repo must be the Git top-level directory")
     identity = git_identity(repo_root)
     if identity["dirty"]:
         raise ValueError("Source checkout is dirty")
@@ -112,9 +115,16 @@ class TierUsage(BaseCallbackHandler):
         self._lock = threading.Lock()
         self._stats: dict[str, dict] = {}
 
+    def _tier(self, tags):
+        return next((tag for tag in (tags or []) if tag in TIERS), "unknown")
+
+    def _stats_for(self, tier):
+        return self._stats.setdefault(tier, {"calls": 0, "error_calls": 0,
+                                             "input_tokens": 0, "output_tokens": 0,
+                                             "usage_unavailable_calls": 0})
+
     def on_llm_end(self, response, **kwargs):
-        tags = kwargs.get("tags") or []
-        tier = next((tag for tag in tags if tag in TIERS), "unknown")
+        tier = self._tier(kwargs.get("tags"))
         usage = (getattr(response, "llm_output", None) or {}).get("token_usage") or {}
         if not usage:
             generations = getattr(response, "generations", [])
@@ -122,11 +132,11 @@ class TierUsage(BaseCallbackHandler):
             usage = getattr(getattr(first, "message", None), "usage_metadata", None) or {}
         input_count = usage.get("prompt_tokens", usage.get("input_tokens"))
         output_count = usage.get("completion_tokens", usage.get("output_tokens"))
-        complete = isinstance(input_count, int) and isinstance(output_count, int)
+        complete = (isinstance(input_count, int) and not isinstance(input_count, bool)
+                    and input_count >= 0 and isinstance(output_count, int)
+                    and not isinstance(output_count, bool) and output_count >= 0)
         with self._lock:
-            stats = self._stats.setdefault(tier, {"calls": 0, "input_tokens": 0,
-                                                  "output_tokens": 0,
-                                                  "usage_unavailable_calls": 0})
+            stats = self._stats_for(tier)
             stats["calls"] += 1
             if complete:
                 if stats["input_tokens"] is not None:
@@ -136,6 +146,17 @@ class TierUsage(BaseCallbackHandler):
                 stats["usage_unavailable_calls"] += 1
                 stats["input_tokens"] = None
                 stats["output_tokens"] = None
+
+    def on_llm_error(self, error, **kwargs):
+        # Provider exception messages can include credentials; retain counts only.
+        tier = self._tier(kwargs.get("tags"))
+        with self._lock:
+            stats = self._stats_for(tier)
+            stats["calls"] += 1
+            stats["error_calls"] += 1
+            stats["usage_unavailable_calls"] += 1
+            stats["input_tokens"] = None
+            stats["output_tokens"] = None
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -229,11 +250,16 @@ def _cost(usage: dict, rates: dict | None) -> dict | None:
         return None
     if any(tier not in rates["tiers"] for tier in usage):
         return None
-    amount = sum(
-        (item["input_tokens"] * rates["tiers"][tier]["input_per_million"]
-         + item["output_tokens"] * rates["tiers"][tier]["output_per_million"]) / 1_000_000
-        for tier, item in usage.items()
-    )
+    try:
+        amount = sum(
+            (item["input_tokens"] * rates["tiers"][tier]["input_per_million"]
+             + item["output_tokens"] * rates["tiers"][tier]["output_per_million"]) / 1_000_000
+            for tier, item in usage.items()
+        )
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(amount):
+        return None
     return {"amount": amount, "currency": rates["currency"],
             "rate_source": rates["source"], "rate_date": rates["date"]}
 
@@ -325,17 +351,32 @@ def run_evaluation(
                 elapsed = time.perf_counter() - started
                 after = git_identity(repo_root)
                 stable = before == after and not after["dirty"] and not after["ignored"]
-                status = "source_changed" if not stable else ("error" if error_type else "ok")
-                if status == "error":
+                all_claims = _plain(result.get("claims", [])) if isinstance(result, dict) else []
+                failed_worker_ids = sorted({claim["worker_id"] for claim in all_claims
+                                            if claim.get("worker_error") and claim.get("worker_id")})
+                successful_worker_ids = {claim.get("worker_id") for claim in all_claims
+                                         if not claim.get("worker_error") and claim.get("worker_id")}
+                if not stable:
+                    status = "source_changed"
+                elif error_type or (failed_worker_ids and not successful_worker_ids):
+                    status = "error"
+                elif failed_worker_ids:
+                    status = "partial_failure"
+                else:
+                    status = "ok"
+                if status in ("error", "partial_failure"):
                     error_records += 1
-                raw_claims = _plain(result.get("claims", [])) if status == "ok" else []
-                checked_claims = _plain(result.get("verified_claims", [])) if status == "ok" else []
-                metrics = measure_claims(checked_claims) if status == "ok" else None
-                subtasks = _plain(result.get("subtasks", [])) if status == "ok" else []
+                keep_result = stable and isinstance(result, dict) and error_type is None
+                raw_claims = all_claims if keep_result else []
+                checked_claims = _plain(result.get("verified_claims", [])) if keep_result else []
+                metrics = measure_claims(checked_claims) if keep_result else None
+                subtasks = _plain(result.get("subtasks", [])) if keep_result else []
                 tokens = usage.snapshot()
                 record = {
                     "schema_version": 1, "question_id": item["id"], "question": item["question"],
                     "repeat": repeat, "status": status, "error_type": error_type,
+                    "failed_worker_count": len(failed_worker_ids) if keep_result else 0,
+                    "failed_worker_ids": failed_worker_ids if keep_result else [],
                     "mode": mode, "measurement_eligible": mode == "real" and status == "ok",
                     "quality_metrics_status": "pending_human_labels",
                     "quality_metrics_eligible": False,
@@ -345,14 +386,14 @@ def run_evaluation(
                     "source_after": after, "engine": engine, "versions": versions,
                     "models": model_ids, "verifier": "deterministic_citation_check",
                     "budget": budget, "elapsed_seconds": elapsed,
-                    "task_count": len(subtasks) if status == "ok" else None,
+                    "task_count": len(subtasks) if keep_result else None,
                     "configured_max_concurrency": max_concurrency,
                     "raw_claims": raw_claims, "claims": checked_claims,
-                    "report": result.get("report") if status == "ok" else None,
+                    "report": result.get("report") if keep_result else None,
                     "metrics": metrics, "usage_by_tier": tokens,
                     "cost": _cost(tokens, rates),
                 }
-                output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                output.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
                 output.flush()
                 if status == "source_changed":
                     return {"status": "source_changed", "records_written": (repeat - 1) *
@@ -365,9 +406,13 @@ def run_evaluation(
 def summarize_records(path: Path) -> dict:
     records = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
     successful = [item for item in records if item.get("status") == "ok"]
-    real = [item for item in successful if item.get("mode") == "real"]
+    real = [item for item in successful if item.get("mode") == "real"
+            and item.get("measurement_eligible", True)]
     return {"record_count": len(records), "success_count": len(successful),
             "error_count": sum(item.get("status") == "error" for item in records),
+            "partial_failure_count": sum(item.get("status") == "partial_failure" for item in records),
+            "operational_failure_count": sum(item.get("status") in ("error", "partial_failure")
+                                             for item in records),
             "source_changed_count": sum(item.get("status") == "source_changed" for item in records),
             "real_record_count": len(real), "demo_record_count": sum(
                 item.get("mode") == "demo" for item in records),

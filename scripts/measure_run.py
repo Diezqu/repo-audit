@@ -9,40 +9,13 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_core.callbacks import BaseCallbackHandler
 
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ENGINE_ROOT / ".env")
 
 from repo_audit import config  # noqa: E402
+from repo_audit.evaluation import TierUsage  # noqa: E402
 from repo_audit.graph import build_graph  # noqa: E402
-
-
-class TierUsage(BaseCallbackHandler):
-    """按模型档累加 token。tier 从 ChatOpenAI 构造时绑定的 tags 里读——
-    与 T8 给 Langfuse 用的是同一份归因标签（config.ModelTier.client），
-    不另建一套映射表。"""
-
-    def __init__(self):
-        self.stats: dict[str, dict] = {}
-
-    def on_llm_end(self, response, **kwargs):
-        tags = kwargs.get("tags") or []
-        tier = next((t for t in tags if t in ("cheap", "flagship")), "unknown")
-        usage = (response.llm_output or {}).get("token_usage") or {}
-        if not usage:
-            gens = [g for gl in response.generations for g in gl]
-            meta = getattr(gens[0].message, "usage_metadata", None) if gens else None
-            if meta:
-                usage = {
-                    "prompt_tokens": meta.get("input_tokens", 0),
-                    "completion_tokens": meta.get("output_tokens", 0),
-                }
-        s = self.stats.setdefault(tier, {"calls": 0, "in": 0, "out": 0})
-        s["calls"] += 1
-        s["in"] += usage.get("prompt_tokens", 0)
-        s["out"] += usage.get("completion_tokens", 0)
-
 
 if len(sys.argv) < 3:
     print(f'用法：{sys.argv[0]} <目标仓库> "<问题>"')
@@ -75,8 +48,16 @@ print(f"Worker 自述支持: {self_reported} 条结论")
 print(f"引用有效的结论 : {valid_claims} 条结论")
 print(f"有效引用总数   : {valid_citations} 条引用")
 print(f"语义已核验支持 : {semantic_verified} 条结论")
-for tier, stats in sorted(usage_cb.stats.items()):
-    print(f"  {tier:9s}: {stats['calls']:2d} 次调用, 输入 {stats['in']:>7,} tok, 输出 {stats['out']:>6,} tok")
-total_in = sum(stats["in"] for stats in usage_cb.stats.values())
-total_out = sum(stats["out"] for stats in usage_cb.stats.values())
-print(f"  合计     : 输入 {total_in:,} tok, 输出 {total_out:,} tok")
+print("Token 用量为回调诊断值；失败或缺失用量时显示未知，不推算费用。")
+usage = usage_cb.snapshot()
+for tier, stats in sorted(usage.items()):
+    input_text = f"{stats['input_tokens']:,}" if stats["input_tokens"] is not None else "未知"
+    output_text = f"{stats['output_tokens']:,}" if stats["output_tokens"] is not None else "未知"
+    print(f"  {tier:9s}: {stats['calls']:2d} 次调用 ({stats['error_calls']} 次失败), "
+          f"输入 {input_text} tok, 输出 {output_text} tok")
+total_in = (sum(stats["input_tokens"] for stats in usage.values())
+            if all(stats["input_tokens"] is not None for stats in usage.values()) else None)
+total_out = (sum(stats["output_tokens"] for stats in usage.values())
+             if all(stats["output_tokens"] is not None for stats in usage.values()) else None)
+print(f"  合计     : 输入 {f'{total_in:,}' if total_in is not None else '未知'} tok, "
+      f"输出 {f'{total_out:,}' if total_out is not None else '未知'} tok")

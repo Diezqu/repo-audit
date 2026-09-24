@@ -556,8 +556,17 @@ def test_worker_transport_failure_preserves_sibling_results(monkeypatch, tmp_pat
     assert {claim.target_module for claim in result["claims"]} == {"fail", "ok"}
     failed = next(c for c in result["claims"] if c.target_module == "fail")
     assert failed.status == "insufficient"
+    assert failed.worker_error == "ConnectError"
+    assert next(c for c in result["claims"] if c.target_module == "ok").worker_error is None
     assert "ConnectError" in failed.statement
     assert "secret-token-should-not-leak" not in result["report"]
+
+
+def test_worker_error_is_runtime_provenance_only():
+    with pytest.raises(ValidationError):
+        graph.WorkerOutput.model_validate({"claims": [{
+            "statement": "not found", "status": "insufficient", "worker_error": "Timeout"
+        }]})
 
 
 def test_worker_programming_error_still_propagates(monkeypatch, tmp_path):
@@ -623,3 +632,16 @@ def test_worktree_git_metadata_file_is_not_evidence(tmp_path):
     assert ".git" not in repo_tree(tmp_path)
     assert repo_stats(tmp_path).total_files == 1
     assert "SECRET METADATA" not in grep_repo(tmp_path, "SECRET")
+
+
+def test_verifier_rejects_git_metadata_even_with_exact_snippet(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "local-note.txt").write_text("private note\n")
+    (tmp_path / "alias").symlink_to(tmp_path / ".git", target_is_directory=True)
+    citations = [Citation(file=path, line_start=1, line_end=1, snippet="private note")
+                 for path in (".git/local-note.txt", "alias/local-note.txt")]
+    checked = _verify(tmp_path, monkeypatch, [_claim(citations=[citation])
+                                           for citation in citations])
+    assert all(claim.citation_status == "invalid" for claim in checked)
+    assert all("private note" not in claim.citation_reason for claim in checked)
+    assert _render_claims(checked)[1] == ""

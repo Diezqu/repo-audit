@@ -82,6 +82,24 @@ def test_read_file_allows_symlink_within_root(sample_repo):
     assert "Sample" in read_file(sample_repo, "internal_link")
 
 
+@pytest.mark.parametrize("path", [".git/HEAD", ".GIT/HEAD", "metadata_alias/HEAD"])
+def test_read_file_rejects_git_metadata(sample_repo, path):
+    (sample_repo / "metadata_alias").symlink_to(sample_repo / ".git", target_is_directory=True)
+    with pytest.raises(PathEscapeError):
+        read_file(sample_repo, path)
+
+
+def test_read_file_directory_still_is_not_a_file(sample_repo):
+    with pytest.raises(FileNotFoundError):
+        read_file(sample_repo, "src")
+
+
+def test_read_file_rejects_worktree_git_file(tmp_path):
+    (tmp_path / ".git").write_text("gitdir: /private/metadata\n")
+    with pytest.raises(PathEscapeError):
+        read_file(tmp_path, ".git")
+
+
 @pytest.fixture
 def repo_with_external_links(sample_repo, tmp_path_factory):
     outside = tmp_path_factory.mktemp("outside")

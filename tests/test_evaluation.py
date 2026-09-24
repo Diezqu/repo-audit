@@ -1,5 +1,6 @@
 import json
 import subprocess
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -7,9 +8,11 @@ import pytest
 
 from repo_audit.evaluation import (
     TierUsage,
+    _cost,
     load_corpus,
     measure_claims,
     run_evaluation,
+    summarize_records,
     validate_corpus,
     validate_rates,
 )
@@ -71,6 +74,14 @@ def test_corpus_rejects_false_snippet_and_unsafe_path(source, tmp_path):
         validate_corpus(load_corpus(corpus, expected_count=1), source, expected_commit=git(source, "rev-parse", "HEAD"))
 
 
+def test_corpus_rejects_repo_subdirectory_even_when_reference_resolves_at_root(source, tmp_path):
+    (source / "sub").mkdir()
+    corpus = corpus_file(tmp_path, git(source, "rev-parse", "HEAD"))
+    with pytest.raises(ValueError, match="top-level"):
+        validate_corpus(load_corpus(corpus, expected_count=1), source / "sub",
+                        expected_commit=git(source, "rev-parse", "HEAD"))
+
+
 def test_usage_missing_is_unavailable_and_parallel_counts_are_safe():
     usage = TierUsage()
     response = SimpleNamespace(llm_output={}, generations=[])
@@ -78,11 +89,103 @@ def test_usage_missing_is_unavailable_and_parallel_counts_are_safe():
         list(pool.map(lambda _: usage.on_llm_end(response, tags=["cheap"]), range(100)))
     assert usage.snapshot()["cheap"] == {
         "calls": 100, "input_tokens": None, "output_tokens": None,
-        "usage_unavailable_calls": 100,
+        "usage_unavailable_calls": 100, "error_calls": 0,
     }
     usage.on_llm_end(SimpleNamespace(llm_output={"token_usage": {
         "prompt_tokens": 3, "completion_tokens": 5}}, generations=[]), tags=["cheap"])
     assert usage.snapshot()["cheap"]["input_tokens"] is None
+
+
+def test_usage_failed_call_is_counted_and_makes_cost_unknown():
+    usage = TierUsage()
+    usage.on_llm_end(SimpleNamespace(llm_output={"token_usage": {
+        "prompt_tokens": 10, "completion_tokens": 5}}, generations=[]), tags=["flagship"])
+    usage.on_llm_error(TimeoutError("private credential"), tags=["cheap"], run_id=uuid.uuid4())
+    stats = usage.snapshot()
+    assert stats["flagship"]["calls"] == 1
+    assert stats["cheap"] == {"calls": 1, "error_calls": 1, "input_tokens": None,
+                              "output_tokens": None, "usage_unavailable_calls": 1}
+    rates = {"currency": "USD", "source": "test", "date": "2026-09-24", "tiers": {
+        tier: {"input_per_million": 1, "output_per_million": 1}
+        for tier in ("cheap", "flagship")}}
+    assert _cost(stats, rates) is None
+    assert "private credential" not in json.dumps(stats)
+
+
+def test_cost_never_returns_nonfinite_amount():
+    rates = {"currency": "USD", "source": "test", "date": "2026-09-24", "tiers": {
+        "cheap": {"input_per_million": 1e308, "output_per_million": 0},
+        "flagship": {"input_per_million": 0, "output_per_million": 0}}}
+    assert _cost({"cheap": {"input_tokens": 1000, "output_tokens": 0}}, rates) is None
+    assert _cost({"cheap": {"input_tokens": 10 ** 1000, "output_tokens": 0}}, rates) is None
+
+
+def test_evaluator_marks_worker_failures_without_misclassifying_insufficiency(source, tmp_path):
+    corpus = corpus_file(tmp_path, git(source, "rev-parse", "HEAD"))
+    commit = git(source, "rev-parse", "HEAD")
+    def claim(worker_id, error=None):
+        value = {"worker_id": worker_id, "statement": "No evidence", "status": "insufficient",
+                 "citations": [], "citation_status": "missing"}
+        if error:
+            value["worker_error"] = error
+        return value
+    for name, claims, expected in (
+        ("partial", [claim("w1", "ReadTimeout"), claim("w2")], "partial_failure"),
+        ("all", [claim("w1", "ReadTimeout")], "error"),
+        ("ordinary", [claim("w1")], "ok"),
+    ):
+        output = tmp_path / f"{name}.jsonl"
+        result = run_evaluation(corpus, source, output, mode="demo", expected_count=1,
+                                expected_commit=commit, invoke=lambda *_args: {
+                                    "subtasks": ["a"], "claims": claims,
+                                    "verified_claims": claims, "report": "partial report"})
+        record = json.loads(output.read_text())
+        assert record["status"] == expected
+        assert record["failed_worker_count"] == (0 if name == "ordinary" else 1)
+        assert record["failed_worker_ids"] == ([] if name == "ordinary" else ["w1"])
+        assert record["report"] == "partial report"
+        assert record["claims"] == claims
+        assert record["measurement_eligible"] is False
+        assert result["error_records"] == (0 if name == "ordinary" else 1)
+        summary = summarize_records(output)
+        assert summary["partial_failure_count"] == (1 if name == "partial" else 0)
+        assert summary["error_count"] == (1 if name == "all" else 0)
+
+
+def test_real_failed_callback_does_not_report_cost_or_success_latency(source, tmp_path, monkeypatch):
+    commit = git(source, "rev-parse", "HEAD")
+    corpus = corpus_file(tmp_path, commit)
+    output = tmp_path / "partial-real.jsonl"
+    for tier in ("CHEAP", "FLAGSHIP"):
+        for field in ("MODEL", "API_KEY", "BASE_URL"):
+            monkeypatch.setenv(f"{tier}_{field}", "test-only")
+
+    def partial_graph(_question, _root, callbacks):
+        usage = callbacks[0]
+        usage.on_llm_end(SimpleNamespace(llm_output={"token_usage": {
+            "prompt_tokens": 10, "completion_tokens": 5}}, generations=[]), tags=["flagship"])
+        usage.on_llm_error(TimeoutError("private credential"), tags=["cheap"],
+                           run_id=uuid.uuid4())
+        claims = [
+            {"worker_id": "w1", "status": "insufficient", "worker_error": "TimeoutError"},
+            {"worker_id": "w2", "status": "insufficient"},
+        ]
+        return {"subtasks": ["a", "b"], "claims": claims, "verified_claims": claims,
+                "report": "surviving report"}
+
+    rates = {"currency": "USD", "source": "test", "date": "2026-09-24", "tiers": {
+        tier: {"input_per_million": 1, "output_per_million": 1}
+        for tier in ("cheap", "flagship")}}
+    run_evaluation(corpus, source, output, mode="real", allow_api=True, expected_count=1,
+                   expected_commit=commit, invoke=partial_graph, rates=rates)
+    record = json.loads(output.read_text())
+    assert record["status"] == "partial_failure"
+    assert record["measurement_eligible"] is False
+    assert record["usage_by_tier"]["cheap"]["error_calls"] == 1
+    assert record["cost"] is None
+    assert record["report"] == "surviving report"
+    assert "private credential" not in output.read_text()
+    assert summarize_records(output)["latency_seconds_by_question"] == {}
 
 
 def test_claim_metrics_do_not_infer_semantic_accuracy():
@@ -138,6 +241,17 @@ def test_run_exception_is_sanitized_and_not_success(source, tmp_path, monkeypatc
     assert record["usage_by_tier"] == {}
     assert record["mode"] == "demo"
     assert record["quality_metrics_eligible"] is False
+
+
+def test_run_non_dict_graph_result_is_sanitized(source, tmp_path):
+    commit = git(source, "rev-parse", "HEAD")
+    output = tmp_path / "non-dict.jsonl"
+    run_evaluation(corpus_file(tmp_path, commit), source, output, mode="demo",
+                   expected_count=1, expected_commit=commit, invoke=lambda *_: "bad result")
+    record = json.loads(output.read_text())
+    assert record["status"] == "error"
+    assert record["error_type"] == "TypeError"
+    assert record["claims"] == []
 
 
 def test_real_requires_explicit_ack_and_both_tiers(source, tmp_path, monkeypatch):

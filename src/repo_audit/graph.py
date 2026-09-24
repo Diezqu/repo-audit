@@ -104,6 +104,7 @@ class Claim(ClaimDraft):
 
     worker_id: str
     target_module: str
+    worker_error: str | None = None
     citation_status: Literal["unchecked", "valid", "invalid", "missing", "unavailable"] = "unchecked"
     citation_reason: str | None = None
     verdict: str | None = None
@@ -493,6 +494,7 @@ def _provider_failure_claims(task: WorkerInput, exc: APIError | TransportError) 
             citations=[],
             worker_id=task["worker_id"],
             target_module=subtask.target_module,
+            worker_error=type(exc).__name__,
         )
         for question in subtask.questions
     ]

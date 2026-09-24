@@ -72,6 +72,11 @@ def _resolve_within(root: Path, rel_path: str) -> Path:
     candidate = (root / rel_path).resolve()
     if not candidate.is_relative_to(root):
         raise PathEscapeError(f"越界路径：{rel_path!r} 解析后跳出仓库根目录 {root}")
+    # A worktree may contain a .git file instead of a directory. Check the
+    # resolved first component so explicit reads and symlink aliases agree.
+    relative = candidate.relative_to(root)
+    if relative.parts and relative.parts[0].casefold() == ".git":
+        raise PathEscapeError(f"Git 元数据路径不可读取：{rel_path!r}")
     return candidate
 
 

@@ -10,7 +10,7 @@ To verify citation integrity against a local checkout, check its HEAD and compar
 
 ## Offline validation
 
-Use a fresh dedicated checkout of FastMCP at `f4ae8bb0af04cb315eef262d38433af4b71d9c38`. Keep virtual environments, caches, and scratch files outside that checkout: evaluation rejects ignored files as well as ordinary untracked or modified files, since repository tools could otherwise read code absent from the pinned commit.
+Use a fresh dedicated checkout of FastMCP at `f4ae8bb0af04cb315eef262d38433af4b71d9c38`, and pass its Git top-level directory as `--repo`. Keep virtual environments, caches, and scratch files outside that checkout: evaluation rejects ignored files as well as ordinary untracked or modified files, since repository tools could otherwise read code absent from the pinned commit.
 
 ```sh
 PYTHONPATH=src python scripts/evaluate.py validate-corpus --repo /path/to/fastmcp
@@ -41,11 +41,11 @@ PYTHONPATH=src python scripts/evaluate.py run \
   --output /tmp/repo-audit-real-fmcp01.jsonl
 ```
 
-The runner enables the deterministic citation verifier. Each JSONL record includes source HEAD, dirty state, and ignored-file presence before and after, engine identity, corpus SHA-256, Python and dependency versions, tier model names, budget, task count, configured concurrency limit, elapsed time, report, raw and checked claims, and callback token usage by tier. An exception yields a sanitized `error_type` and no successful report. A source change, including an ignored file appearing during a run, yields `source_changed`, drops the report, and stops the batch. The task count is the Planner's number of subtasks; configured concurrency is a separate limit, not observed simultaneous API calls.
+The runner enables the deterministic citation verifier. Each JSONL record includes source HEAD, dirty state, and ignored-file presence before and after, engine identity, corpus SHA-256, Python and dependency versions, tier model names, budget, task count, configured concurrency limit, elapsed time, report, raw and checked claims, and callback token usage by tier. Worker provider failures carry a sanitized runtime `worker_error` type on their claims, plus `failed_worker_count` and `failed_worker_ids` in the record; ordinary evidence insufficiency has no worker error. When some Workers fail, the stable-source result is `partial_failure`; when all fail, it is `error`. Both keep available claims and report but are excluded from real latency measurements. A graph exception yields a sanitized `error_type` and no report. A source change, including an ignored file appearing during a run, yields `source_changed`, drops the report, and stops the batch. The task count is the Planner's number of subtasks; configured concurrency is a separate limit, not observed simultaneous API calls.
 
-`raw_supported_count` is the Worker's own status. `raw_citation_count` counts every claim citation. `citation_valid_claim_count` counts claims whose deterministic `citation_status` is `valid` and have citations. `citations_on_all_valid_claims` counts citations on those claims. `semantic_verified_count` counts non-null independent verdicts; in this deterministic first round it should be zero. These are not answer accuracy measurements. Token fields are `null` if any model response for that tier omitted usage; missing usage is never treated as zero.
+`raw_supported_count` is the Worker's own status. `raw_citation_count` counts every claim citation. `citation_valid_claim_count` counts claims whose deterministic `citation_status` is `valid` and have citations. `citations_on_all_valid_claims` counts citations on those claims. `semantic_verified_count` counts non-null independent verdicts; in this deterministic first round it should be zero. These are not answer accuracy measurements. Token fields are `null` if any model response omitted usage or a call failed in that tier; failed calls are counted without recording provider error text.
 
-Cost is `null` unless an explicit rate JSON file is passed using `--rates`. Rates use the actual configured tier model prices and must include a currency, source, date, and finite nonnegative numeric input/output prices per million tokens; booleans and nonfinite values are rejected before a run. For example, **replace these illustrative values with verified rates before use**:
+Cost is `null` unless an explicit rate JSON file is passed using `--rates` and all usage is known. Rates use the actual configured tier model prices and must include a currency, source, date, and finite nonnegative numeric input/output prices per million tokens; booleans and nonfinite values are rejected before a run. Arithmetic overflow also yields `null`. For example, **replace these illustrative values with verified rates before use**:
 
 ```json
 {
@@ -59,4 +59,4 @@ Cost is `null` unless an explicit rate JSON file is passed using `--rates`. Rate
 }
 ```
 
-The draft references remain unreviewed. Human scoring needs a separate, explicit label file and review protocol; no expected-answer string match or snippet overlap is accepted as semantic truth. The summary therefore reports record counts and per-question real-run latencies, and leaves quality metrics pending human labels.
+The draft references remain unreviewed. Human scoring needs a separate, explicit label file and review protocol; no expected-answer string match or snippet overlap is accepted as semantic truth. The summary reports separate `error_count`, `partial_failure_count`, and combined `operational_failure_count`; real-run latencies include only eligible `ok` records. Quality metrics remain pending human labels.
