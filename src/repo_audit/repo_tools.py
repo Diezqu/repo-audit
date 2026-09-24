@@ -208,7 +208,7 @@ def _grep_with_rg(root: Path, pattern: str, glob: str | None, max_results: int) 
     if glob:
         cmd += ["--glob", glob]
     cmd += ["--", pattern]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, cwd=root)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, cwd=root, check=False)
     if proc.returncode not in (0, 1):  # 1 = 无匹配，是正常结果不是错误
         raise subprocess.SubprocessError((proc.stderr or "rg 非零退出").strip())
     lines = [ln for ln in proc.stdout.splitlines() if ln]

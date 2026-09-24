@@ -50,6 +50,7 @@ if not target.is_dir():
     sys.exit(1)
 
 from langfuse import get_client  # noqa: E402
+
 from repo_audit import config  # noqa: E402
 from repo_audit.graph import build_graph  # noqa: E402 （依赖上面 load_dotenv 先执行）
 from repo_audit.repo_tools import PathEscapeError, read_file  # noqa: E402

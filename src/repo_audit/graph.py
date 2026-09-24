@@ -66,12 +66,17 @@ from repo_audit import config
 from repo_audit.repo_tools import (
     PathEscapeError,
     _resolve_within,
-    grep_repo as _grep_repo,
-    read_file as _read_file,
     repo_stats,
+)
+from repo_audit.repo_tools import (
+    grep_repo as _grep_repo,
+)
+from repo_audit.repo_tools import (
+    read_file as _read_file,
+)
+from repo_audit.repo_tools import (
     repo_tree as _repo_tree,
 )
-
 
 # ──────────────────────────────────────────────────────────────
 # 数据结构
@@ -604,7 +609,7 @@ def worker(task: WorkerInput) -> dict:
             forced_llm = base_llm.bind_tools(submit_only, tool_choice=choice)
             try:
                 ai_msg = forced_llm.invoke(messages)
-            except Exception:  # noqa: BLE001 — 供应商不认这个 tool_choice 形态：换下一档，不崩
+            except Exception:  # noqa: BLE001, S112 — 供应商不认这个 tool_choice 形态：换下一档，不崩
                 continue
             messages.append(ai_msg)
             output, _ = _handle_tool_calls(ai_msg, tool_map, messages, query_calls)

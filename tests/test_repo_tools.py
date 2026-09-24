@@ -215,7 +215,7 @@ def test_grep_repo_uses_rg_when_available(sample_repo, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/rg" if name == "rg" else None)
     captured = {}
 
-    def fake_run(cmd, capture_output, text, timeout, cwd=None):
+    def fake_run(cmd, capture_output, text, timeout, cwd=None, **kwargs):
         captured["cmd"] = cmd
         captured["cwd"] = cwd
 
@@ -250,7 +250,7 @@ def test_grep_repo_rg_failure_falls_back_to_pure_python(sample_repo, monkeypatch
 def test_grep_repo_rg_no_match_returncode_is_not_error(sample_repo, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/rg" if name == "rg" else None)
 
-    def fake_run(cmd, capture_output, text, timeout, cwd=None):
+    def fake_run(cmd, capture_output, text, timeout, cwd=None, **kwargs):
         class _Result:
             returncode = 1  # rg: 1 = 无匹配，不是错误
             stdout = ""
