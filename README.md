@@ -1,82 +1,87 @@
-# repo-audit · 多智能体代码库调研核验引擎
+# repo-audit · 代码库调研与引用检查
 
-> 原名 decision-engine（消费决策调研），2026-07-21 经 D15 决策换域改名，git 历史完整保留——决策过程本身见 [DECISIONS.md](DECISIONS.md)。
-
-给它一个本地代码仓库和问题，Planner 根据仓库地图拆解任务，并行 Worker 用只读工具检索源码，合成器生成带 `file:行号` 引用的回答。目前 Verifier **默认关闭**；开启后会独立回读源码，驳回越界、无效行号及与源码不符的引用片段。
-
-## 当前能力与边界
-
-- 已实现 LangGraph Planner → 动态并行 Worker → Verifier → Synthesizer；Worker 使用 `repo_tree`、`read_file`、`grep_repo`，有路径限制、输出截断和工具调用预算。
-- Verifier 当前只做**确定性的引用检查**：文件路径、行号范围和片段内容。引用存在不代表结论的语义得到证明；语义判定尚未实现，不能把 Worker 的 `supported` 当成独立核验结果。
-- 无模型密钥时会运行假数据模式，用于检查流程和测试；输出不代表对目标仓库完成了真实调研。
-- 评测集、Verifier 开关对照实验和 FastMCP 服务尚未实现；目前没有可复现的引用错误率数字。
-
-## 目标形态
-
-```bash
-repo-audit ask ./langgraph/ "checkpoint 能否跨进程恢复？"
-# ✅ 支持，需配置持久化 checkpointer
-#    依据: libs/checkpoint/sqlite.py L41-88 [已核验]
-repo-audit onboard ./langgraph/   # 架构全景 / 代码意图 / 特例规则 三份文档（v1.1）
-```
-
-## 架构
-
-```
-输入：仓库 + 问题
-   │
-   ▼
-Planner（旗舰档）：读地图（repo_stats + 目录树 + README 头部）
-   → 拆 3~8 个子任务，写入 LangGraph 状态
-   │
-   ▼ Send 并行
-Worker 池（便宜档 × N）：tree / read_file / grep 取证
-   → 结构化 Claim {结论, [file, L起-L止, snippet]}
-   │  （每 Worker 工具调用上限 8 次——成本护栏）
-   ▼
-Verifier（默认关闭，可开关）：回读文件、行号和片段
-   → 无效引用标 refuted；有效引用仍待语义判定
-   │
-   ▼
-合成器（旗舰档）→ 带引用回答，证据不足显式标注
-```
-
-## 关键选型（完整推导见 [DECISIONS.md](DECISIONS.md)）
-
-| 选型 | 定案 | 一句话理由 |
-|---|---|---|
-| 编排 | LangGraph 显式状态机 | 断点续跑、逐节点测试、Send 并行原生语义（D2） |
-| 检索 | 结构化导航（tree/read/grep），**无向量库** | 代码=精确标识符世界，grep 零误差零基建；embedding 切碎代码结构（D15） |
-| 模型 | DeepSeek/Qwen 便宜档 + 旗舰档双档路由 | 翻文件是体力活，规划合成是脑力活；成本可归因 |
-| 核验 | 独立 Verifier 节点 + 开关 flag | 先做可确定的引用检查；语义判定仍待实现 |
-| AST/调用图 | v1 不做 | 时间盒守恒；grep 覆盖八成需求 |
-
-## 现状（2026-07-21 起七天冲刺）
-
-- [x] LangGraph 骨架：Planner → 动态并行 Worker（Send）→ 合成器
-- [x] 双档模型路由 / 结构化证据 / pytest + CI
-- [x] 15 条架构决策记录 + 战伤日志（含一次完整止损：D10–D15 消费数据行业级死题 → 保引擎换领域）
-- [x] 仓库工具层（tree / read_file / grep / repo_stats，路径白名单 + 输出截断，见 D16）
-- [x] 本地仓库只读取证工具替换旧网搜路径（见 D16）
-- [x] Verifier 开关与文件、行号、片段检查
-- [ ] 结论与引用之间的独立语义判定
-- [ ] 30 题评测集（LangGraph + FastMCP，pin commit）+ 10 题人工金标 + judge + 回归 CI
-- [ ] Verifier 开/关 ablation 数字
-- [ ] FastMCP server 化（`ask_repo` 工具，Claude Code / Cursor 可直接调用）
+输入一个本地仓库和问题，程序读取仓库地图，拆出有界子任务，并行检索源码，再输出逐条列明引用状态的报告。**引用有效只表示所指文件、行号和原文片段能被回读；它不证明结论在语义上成立。** 报告保留这一边界，仍需人工判断代码是否支持结论。
 
 ## 快速开始
 
+需要 Python 3.12 及以上；CI 覆盖 3.12 和 3.13。以下命令在仓库根目录执行：
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env   # 填入两档模型的 API key
-pytest                 # 冒烟测试
-python -m repo_audit.graph /path/to/repo "这个仓库的整体架构是怎样的？"
+python -m repo_audit.graph --demo . "这个仓库如何组织代码？"
 ```
 
-不配置模型密钥时，上面的命令会输出标明“假数据”的流程示例。真实调研需要在 `.env` 中配置模型；`VERIFIER_ENABLED=true` 可开启引用检查。当前没有 `repo-audit ask` 或 `onboard` 命令，前面的“目标形态”仅是规划。
+`--demo` 显式运行不调用模型的流程示例。其结论是占位内容，**不能用于判断目标仓库**；即使已配置模型密钥，`--demo` 也只运行示例模式。路径必须指向存在的目录。若省略问题，CLI 使用默认的架构问题；显式给出的空白问题会报错。
 
-## 决策与战伤
+上面命令的实际输出（**虚构数据**；占位引用 `FAKE.md` 并非真实证据）：
 
-- [DECISIONS.md](DECISIONS.md) — 15 条技术决策：每条含备选、取舍与「面试一句话」
-- [BATTLE_LOG.md](BATTLE_LOG.md) — 真实故障的排查与修复记录
+```text
+# 代码库调研报告：这个仓库如何组织代码？
+
+语义未核验；以下仅检查引用与源码是否一致。
+
+- 引用无效，语义未核验 —— （假数据）关于「这个目录对外暴露什么接口？」的占位结论 （src/）
+- 缺少引用，语义未核验；存疑：证据不足 —— （假数据）证据不足：有没有明显的边界条件处理？ （src/）
+- 引用无效，语义未核验 —— （假数据）关于「测试覆盖了哪些行为？」的占位结论 （tests/）
+```
+
+真实调研默认运行真实模式。先复制 `.env.example` 为 `.env`，配置 `CHEAP_MODEL`、`CHEAP_API_KEY`、`CHEAP_BASE_URL` 和 `FLAGSHIP_MODEL`、`FLAGSHIP_API_KEY`、`FLAGSHIP_BASE_URL`，再执行：
+
+```bash
+cp .env.example .env
+# 编辑 .env，填入六项模型配置
+python -m repo_audit.graph /path/to/repository "这个仓库如何处理失败的工具调用？"
+```
+
+真实模式在调用模型前要求两档配置齐全；配置缺失会报错退出，不会混用真实与占位结果。两档是 Planner 与 Worker 的配置角色，不要求必须使用不同的模型或供应商。模型请求可能产生费用；本项目没有发布可靠的每次运行成本估计。不要在公开仓库提交 `.env`、密钥或私有仓库内容。可选的 Langfuse 配置见 `.env.example`；不配置时不启用追踪。
+
+本地验证：
+
+```bash
+ruff check .
+pytest -q
+```
+
+## 工作流程
+
+```text
+问题 + repo_stats + 浅层目录树 + README 开头
+                  │
+                  ▼
+         Planner：1–8 个子任务
+                  │ LangGraph Send
+                  ▼
+      Worker：tree / grep / read 取证
+                  │ 每个 Worker 最多尝试 8 次查询工具调用
+                  ▼
+         Verifier：确定性引用检查
+                  ▼
+       确定性报告：引用状态 + 语义未核验
+```
+
+子任务数是 **1–8**，表示最多派发的 Worker 任务数，**不是实测同时运行数**。每个子任务有 1–3 个具体问题。查询预算按尝试计数，预算耗尽后不得继续读仓库；`submit_claims` 是交卷动作。Worker 自报的 `supported` 只表示它认为自己找到依据。Verifier 默认开启，检查引用路径、行号范围和非空原文片段；任何一条引用无效，整条结论的引用状态为无效。无引用、读取失败、显式关闭检查和有效引用各有不同状态。它不会把结论判成“语义支持”或“语义反驳”。
+
+报告由确定性模板生成，目前没有自由生成的 LLM 合成器。真实模式若个别 Worker 遇到供应商或传输错误，该任务会降级为证据不足并保留其他任务结果；配置错误会在规划前失败。仓库内容可能在工具读取与引用检查之间变化，因此引用检查对应**检查时**的文件内容，不是仓库快照。
+
+## 边界与评测
+
+- 工具入口限制在给定仓库根目录内；遍历跳过符号链接，直接读取只允许解析后仍在根目录内的文件。这是应用层路径约束，**不是操作系统沙箱**，也不保证抵御并发修改文件系统造成的竞态。
+- `grep_repo` 优先使用 `rg`，没有时使用 Python 回退。两条路径的正则和忽略规则可能不同；命中与否都不能直接视作完整性证明。
+- 当前没有 checkpoint 持久化、向量数据库、MCP 服务、独立语义判定或自动生成架构文档命令。LangGraph 提供相关能力，不代表本项目已接线。
+- [评测草案](eval/README.md) 含固定提交上的 10 道待人工复核问题；它还不是人工金标，也没有已发布的模型质量分数。评测应分别统计 Worker 自报、引用有效性和人工语义判断，保留模型配置、语料提交与运行记录。
+
+评测脚本支持离线校验、限定题目运行和汇总。先准备评测 README 指定提交的**干净专用检出**，包括不能存在未跟踪或被忽略的文件；输出文件必须新建在引擎与目标仓库之外：
+
+```bash
+PYTHONPATH=src python scripts/evaluate.py validate-corpus --repo /path/to/fastmcp
+PYTHONPATH=src python scripts/evaluate.py run --repo /path/to/fastmcp \
+  --mode demo --id FMCP-01 --output /tmp/repo-audit-demo.jsonl
+PYTHONPATH=src python scripts/evaluate.py summarize \
+  --records /tmp/repo-audit-demo.jsonl
+```
+
+这些演示记录同样是合成数据，不能用于回答质量统计。真实评测还需显式 `--mode real --allow-api`、六项模型环境变量和新的输出路径；详见 [评测说明](eval/README.md)。当前结果汇总只报告运行记录和时间，不提供语义质量分数；费用估计须单独给出可核对的费率。
+
+设计与现状见 [架构说明](docs/current-architecture.md) 和 [决策记录](DECISIONS.md)；故障复盘见 [BATTLE_LOG.md](BATTLE_LOG.md)。D1–D16 是历史决策，当前行为以本文、架构说明和代码为准。
