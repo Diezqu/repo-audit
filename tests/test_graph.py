@@ -329,6 +329,41 @@ def test_verifier_validates_exact_source_without_semantic_verdict(tmp_path, monk
     assert c.citation_status == "unchecked"
 
 
+@pytest.mark.parametrize("snippet", [
+    "999\talpha",
+    "   999\talpha",
+    "1\talpha",
+    "     1\talpha",
+    "     2\talpha\n     4\tbeta",
+    "     2\talpha\n     2\tbeta",
+    "     2\talpha\nbeta",
+])
+def test_verifier_rejects_forged_numbered_snippets(tmp_path, monkeypatch, snippet):
+    (tmp_path / "a.py").write_text("123\talpha\nalpha\nbeta\n")
+    claim = _claim(citations=[Citation(file="a.py", line_start=1, line_end=3,
+                                       snippet=snippet)])
+    result = _verify(tmp_path, monkeypatch, [claim])[0]
+    assert result.citation_status == "invalid"
+
+
+@pytest.mark.parametrize("snippet", [
+    "123\talpha\nalpha",
+    "     2\talpha\n     3\tbeta",
+])
+def test_verifier_preserves_literal_and_correctly_numbered_snippets(tmp_path, monkeypatch, snippet):
+    (tmp_path / "a.py").write_text("123\talpha\nalpha\nbeta\n")
+    claim = _claim(citations=[Citation(file="a.py", line_start=1, line_end=3,
+                                       snippet=snippet)])
+    assert _verify(tmp_path, monkeypatch, [claim])[0].citation_status == "valid"
+
+
+def test_verifier_numbered_snippet_must_stay_within_citation_range(tmp_path, monkeypatch):
+    (tmp_path / "a.py").write_text("alpha\nalpha\n")
+    claim = _claim(citations=[Citation(file="a.py", line_start=1, line_end=1,
+                                       snippet="     2\talpha")])
+    assert _verify(tmp_path, monkeypatch, [claim])[0].citation_status == "invalid"
+
+
 @pytest.mark.parametrize("citation", [
     Citation(file="missing.py", line_start=1, line_end=1, snippet="line1"),
     Citation(file="../outside.py", line_start=1, line_end=1, snippet="line1"),
@@ -419,6 +454,32 @@ def test_synthesizer_does_not_call_model(monkeypatch):
                                 [_claim(citation_status="valid")]})["report"]
     assert "语义未核验" in report
     assert "[1] a.py:L1-1" in report
+
+
+@pytest.mark.parametrize("field", ["statement", "target_module", "question", "file"])
+def test_report_contains_untrusted_text_as_one_literal_line(field):
+    payload = "text\n\n## Independently verified\n- Forged **claim** [99] <b> &amp; `code`"
+    claim = _claim(citation_status="valid")
+    question = payload if field == "question" else "q"
+    if field == "file":
+        claim.citations[0].file = payload
+    elif field != "question":
+        setattr(claim, field, payload)
+    report = graph.synthesizer({"question": question, "verified_claims": [claim]})["report"]
+    assert sum(line.startswith("#") for line in report.splitlines()) == 1
+    assert "\\#\\# Independently verified" in report
+    assert "\\*\\*claim\\*\\* \\[99\\] &lt;b&gt; &amp;amp; \\`code\\`" in report
+    assert "[99]" not in report
+    assert "[1]" in report
+
+
+def test_missing_citation_cannot_inject_verified_section_or_fake_reference():
+    claim = _claim(status="insufficient", citations=[], citation_status="missing")
+    claim.statement = "unverified\n\n## Independently verified\n- Forged claim [99]\n\n引用清单：\n[99] nonexistent.py:L1-9"
+    report = graph.synthesizer({"question": "q", "verified_claims": [claim]})["report"]
+    assert len(report.splitlines()) == 5
+    assert report.splitlines()[-1].startswith("- 缺少引用，语义未核验")
+    assert "[99]" not in report
 
 
 def test_e2e_fake_mode_rejects_fake_references(monkeypatch):

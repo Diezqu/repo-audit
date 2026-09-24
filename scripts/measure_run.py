@@ -61,18 +61,20 @@ result = build_graph().invoke(
 elapsed = time.perf_counter() - t0
 
 claims = result["verified_claims"]
-workers = {c.worker_id for c in claims}
+worker_tasks = len(result["subtasks"])
 self_reported = sum(c.status == "supported" for c in claims)
-valid_citations = sum(c.citation_status == "valid" for c in claims)
+valid_claims = sum(c.citation_status == "valid" for c in claims)
+valid_citations = sum(len(c.citations) for c in claims if c.citation_status == "valid")
 semantic_verified = sum(c.verdict == "supported" and c.citation_status == "valid" for c in claims)
 
 print(f"\n{'=' * 58}\n计量结果：{target.name}    问题：{question[:40]}…\n{'=' * 58}")
 print(f"耗时           : {elapsed:.1f}s")
-print(f"Worker 任务数  : {len(workers)}（不代表实际并发数）")
-print(f"结论总数       : {len(claims)}")
-print(f"Worker 自述支持: {self_reported}")
-print(f"引用有效       : {valid_citations}")
-print(f"语义已核验支持 : {semantic_verified}")
+print(f"Worker 任务数  : {worker_tasks} 个任务（不代表实际并发数）")
+print(f"结论总数       : {len(claims)} 条结论")
+print(f"Worker 自述支持: {self_reported} 条结论")
+print(f"引用有效的结论 : {valid_claims} 条结论")
+print(f"有效引用总数   : {valid_citations} 条引用")
+print(f"语义已核验支持 : {semantic_verified} 条结论")
 for tier, stats in sorted(usage_cb.stats.items()):
     print(f"  {tier:9s}: {stats['calls']:2d} 次调用, 输入 {stats['in']:>7,} tok, 输出 {stats['out']:>6,} tok")
 total_in = sum(stats["in"] for stats in usage_cb.stats.values())

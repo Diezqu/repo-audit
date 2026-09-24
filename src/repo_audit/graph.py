@@ -4,6 +4,7 @@ Citation checks compare source coordinates and exact snippets. Semantic
 support is not judged in this release; reports label that limit explicitly.
 """
 
+import html
 import operator
 import re
 import sys
@@ -612,6 +613,35 @@ def worker(task: WorkerInput) -> dict:
 # 节点：Verifier（确定性引用检查）
 # ──────────────────────────────────────────────────────────────
 
+def _snippet_matches(citation: Citation, lines: list[str]) -> bool:
+    """Accept literal source, or complete read_file rows at their stated lines."""
+    if not citation.snippet.strip():
+        return False
+    source = "\n".join(lines[citation.line_start - 1:citation.line_end])
+    if citation.snippet in source:
+        return True
+
+    previous = None
+    excerpts = []
+    for row in citation.snippet.split("\n"):
+        prefix, separator, excerpt = row.partition("\t")
+        try:
+            number = int(prefix)
+        except ValueError:
+            return False
+        if (
+            not separator
+            or prefix != f"{number:>6}"
+            or not citation.line_start <= number <= citation.line_end
+            or (previous is not None and number != previous + 1)
+            or excerpt != lines[number - 1]
+        ):
+            return False
+        previous = number
+        excerpts.append(excerpt)
+    return bool("\n".join(excerpts).strip())
+
+
 def _judge_claim(
     root: Path, claim: Claim, cache: dict[Path, tuple[list[str] | None, str | None]] | None = None,
 ) -> tuple[Literal["valid", "invalid", "missing", "unavailable"], str | None]:
@@ -648,11 +678,7 @@ def _judge_claim(
         if not 1 <= c.line_start <= c.line_end <= len(lines):
             failures.append(("invalid", f"{c.file}: invalid line range"))
             continue
-        # read_file displays a five-column line number and a tab. Remove only
-        # that display prefix; otherwise compare the worker excerpt verbatim.
-        snippet = re.sub(r"(?m)^[ \t]*\d+\t", "", c.snippet)
-        source = "\n".join(lines[c.line_start - 1:c.line_end])
-        if not snippet.strip() or snippet not in source:
+        if not _snippet_matches(c, lines):
             failures.append(("invalid", f"{c.file}: snippet differs from source"))
     if failures:
         return next(((kind, reason) for kind, reason in failures if kind == "invalid"), failures[0])
@@ -680,6 +706,12 @@ def verifier(state: State) -> dict:
 # 节点：Synthesizer
 # ──────────────────────────────────────────────────────────────
 
+def _report_text(value: str) -> str:
+    """Keep external text on one line, with HTML and inline Markdown inert."""
+    text = " ".join(value.split())
+    return html.escape(re.sub(r"([\\`*_{}\[\]()#+!|~])", r"\\\1", text))
+
+
 def _render_claims(claims: list[Claim]) -> tuple[str, str]:
     """Deterministically label claims; number only citation-valid references."""
     claim_lines: list[str] = []
@@ -700,15 +732,21 @@ def _render_claims(claims: list[Claim]) -> tuple[str, str]:
             for c in claim.citations:
                 n = len(citation_lines) + 1
                 marks.append(f"[{n}]")
-                citation_lines.append(f"[{n}] {c.file}:L{c.line_start}-{c.line_end}")
-        claim_lines.append(f"- {label} —— {claim.statement} {''.join(marks)}（{claim.target_module}）")
+                citation_lines.append(f"[{n}] {_report_text(c.file)}:L{c.line_start}-{c.line_end}")
+        claim_lines.append(
+            f"- {label} —— {_report_text(claim.statement)} {''.join(marks)}"
+            f"（{_report_text(claim.target_module)}）"
+        )
     return "\n".join(claim_lines) if claim_lines else "（无结论）", "\n".join(citation_lines)
 
 
 def synthesizer(state: State) -> dict:
     """Compose a report from verified_claims without a model rewrite."""
     body, citations = _render_claims(state["verified_claims"])
-    report = f"# 代码库调研报告：{state['question']}\n\n语义未核验；以下仅检查引用与源码是否一致。\n\n{body}"
+    report = (
+        f"# 代码库调研报告：{_report_text(state['question'])}\n\n"
+        f"语义未核验；以下仅检查引用与源码是否一致。\n\n{body}"
+    )
     if citations:
         report += f"\n\n---\n引用清单：\n{citations}"
     return {"report": report}
