@@ -51,7 +51,7 @@ _SKIP_DIRS = {
     "node_modules", ".pytest_cache", ".ruff_cache", ".mypy_cache",
     "dist", "build", ".idea", ".vscode",
 }
-_SKIP_FILES = {".DS_Store"}
+_SKIP_FILES = {".DS_Store", ".git"}
 
 
 # ── 护栏 1：路径 ──────────────────────────────────────────────────

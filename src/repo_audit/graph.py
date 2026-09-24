@@ -4,6 +4,7 @@ Citation checks compare source coordinates and exact snippets. Semantic
 support is not judged in this release; reports label that limit explicitly.
 """
 
+import argparse
 import html
 import operator
 import re
@@ -11,11 +12,13 @@ import sys
 from pathlib import Path
 from typing import Annotated, Literal, TypedDict
 
+from httpx import TransportError
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langfuse import get_client
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
+from openai import APIError
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from repo_audit import config
@@ -155,7 +158,7 @@ def _readme_head(root: Path, *, max_lines: int = 60, max_chars: int = 2000) -> s
     """
     for name in ("README.md", "README.rst"):
         path = root / name
-        if path.is_file():
+        if not path.is_symlink() and path.is_file():
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
             return "\n".join(lines[:max_lines])[:max_chars]
     return "（无 README）"
@@ -202,7 +205,7 @@ def planner(state: State) -> dict:
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a nonblank string")
     tier = config.try_flagship_tier()
-    if tier is None:  # 假数据模式（D6）：结构与真路径完全一致，CI 无密钥照跑
+    if tier is None:  # Explicit demo mode only.
         return {
             "subtasks": [
                 SubTask(
@@ -470,7 +473,7 @@ def _handle_tool_calls(
             continue
         try:
             result = tool_map[name].invoke(tool_call["args"])
-        except (PathEscapeError, ValueError, FileNotFoundError) as exc:
+        except (PathEscapeError, ValueError, OSError) as exc:
             # 铁律 3/6 的下游消费方式：工具异常不是致命错误，是模型给错了
             # 参数（越界路径/非法正则/文件不存在），把错误文本原样回给
             # 模型自己调整，绝不让整个 Worker 崩掉。
@@ -478,6 +481,21 @@ def _handle_tool_calls(
         messages.append(ToolMessage(content=str(result), tool_call_id=tool_call["id"]))
 
     return output, query_calls
+
+
+def _provider_failure_claims(task: WorkerInput, exc: APIError | TransportError) -> list[Claim]:
+    """Keep a failed worker in the report without exposing provider error text."""
+    subtask = task["subtask"]
+    return [
+        Claim(
+            statement=f"证据不足：{question}（模型调用失败：{type(exc).__name__}）",
+            status="insufficient",
+            citations=[],
+            worker_id=task["worker_id"],
+            target_module=subtask.target_module,
+        )
+        for question in subtask.questions
+    ]
 
 
 def worker(task: WorkerInput) -> dict:
@@ -492,7 +510,7 @@ def worker(task: WorkerInput) -> dict:
     """
     subtask = task["subtask"]
     tier = config.try_cheap_tier()
-    if tier is None:  # 假数据模式（D6）
+    if tier is None:  # Explicit demo mode only.
         return {"claims": _fake_claims(task)}
 
     root = Path(task["repo_root"])
@@ -524,7 +542,10 @@ def worker(task: WorkerInput) -> dict:
 
     while output is None and query_calls < MAX_QUERY_CALLS and rounds < max_rounds:
         rounds += 1
-        ai_msg = llm.invoke(messages)
+        try:
+            ai_msg = llm.invoke(messages)
+        except (APIError, TransportError) as exc:
+            return {"claims": _provider_failure_claims(task, exc)}
         messages.append(ai_msg)
         if not ai_msg.tool_calls and not ai_msg.invalid_tool_calls:
             break  # 模型放弃了工具协议、直接吐了段文字——没什么好等的，进强制交卷
@@ -572,18 +593,23 @@ def worker(task: WorkerInput) -> dict:
             )
         )
         submit_only = [tool_map["submit_claims"]]
+        last_provider_error = None
         for choice in ("submit_claims", "auto"):
             forced_llm = base_llm.bind_tools(submit_only, tool_choice=choice)
             try:
                 ai_msg = forced_llm.invoke(messages)
-            except Exception:  # noqa: BLE001, S112 — 供应商不认这个 tool_choice 形态：换下一档，不崩
+            except (APIError, TransportError) as exc:
+                last_provider_error = exc
                 continue
+            last_provider_error = None
             messages.append(ai_msg)
             output, _ = _handle_tool_calls(
                 ai_msg, tool_map, messages, query_calls, allow_queries=False
             )
             if output is not None:
                 break
+        if output is None and last_provider_error is not None:
+            return {"claims": _provider_failure_claims(task, last_provider_error)}
 
     if output is None:
         # 强制那一轮仍没拿到合法结构化输出（模型没配合协议/参数校验失败）
@@ -772,40 +798,39 @@ def build_graph():
     return g.compile()
 
 
-if __name__ == "__main__":
-    # 用法：python -m repo_audit.graph <repo_path> "问题"
-    # 不给参数时的默认示例改成对本仓库自身提问——不必配置任何外部路径，
-    # clone 下来就能立刻看到一次真实的端到端产出（D6"零配置先看到骨架跑
-    # 起来"的延伸：零配置也能跑一次真实提问，而不只是看到假数据）。
-    _default_root = Path(__file__).resolve().parents[2]
-    repo_root = sys.argv[1] if len(sys.argv) >= 2 else str(_default_root)
-    question = (
-        " ".join(sys.argv[2:])
-        if len(sys.argv) >= 3
-        else "这个仓库的整体架构是怎样的？分几层，各层职责是什么？"
-    )
-    # T8：Langfuse 观测埋点。无密钥时 langfuse_handler() 返回 None——不传
-    # callbacks，invoke() 与接入前完全一样，零副作用（设计说明见
-    # config.langfuse_handler）。有密钥时把 handler 通过 LangGraph 的
-    # RunnableConfig 传进去：LangGraph 会把这一个 callback 自动传播到图内
-    # 全部节点（含 fan_out 用 Send 动态派发出的每个并行 worker）产生的每一次
-    # LLM 调用上，不需要在 planner/worker/synthesizer 三个节点里各自手动埋点。
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Audit a repository with cited evidence")
+    parser.add_argument("--demo", action="store_true", help="run with fabricated sample claims")
+    parser.add_argument("repo", nargs="?", default=str(Path(__file__).resolve().parents[2]))
+    parser.add_argument("question", nargs="*", help="natural-language repository question")
+    args = parser.parse_args(argv)
+    if args.demo:
+        import os
+
+        os.environ["REPO_AUDIT_MODE"] = "demo"
+    root = Path(args.repo).resolve()
+    if not root.is_dir():
+        parser.error(f"repository path is not a directory: {root}")
+    question = " ".join(args.question) if args.question else "这个仓库的整体架构是怎样的？"
+    if not question.strip():
+        parser.error("question must be nonblank")
+    try:
+        config.try_flagship_tier()  # validates both real tiers before graph/model calls
+    except (RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+
     handler = config.langfuse_handler()
     invoke_kwargs = {"config": {"callbacks": [handler]}} if handler is not None else {}
     try:
         result = build_graph().invoke(
-            {"question": question, "repo_root": repo_root}, **invoke_kwargs
+            {"question": question, "repo_root": str(root)}, **invoke_kwargs
         )
         print(result["report"])
+        return 0
     finally:
-        # 短脚本进程退出前必须显式收尾：Langfuse 4.x 是批量异步上报，不
-        # flush 就让进程退出，缓冲区里还没发出去的 trace 会直接丢失。放在
-        # finally 而不是紧跟在 invoke() 后面，是为了 invoke() 本身抛异常时
-        # 也能把已经产生的 trace 发出去——报错的这次调用恰恰是最需要观测
-        # 数据排查的一次，不能因为进程要退出就先丢了它。用 shutdown() 而
-        # 不是 flush()：这是进程退出前的最后一步，shutdown() 在 flush 之后
-        # 顺带把后台上报线程也干净收掉，比只 flush 更贴合"马上要退出"这个
-        # 场景（get_client() 拿到的是 CallbackHandler 内部同一个单例，见
-        # langfuse.get_client 源码里的 LangfuseResourceManager 单例表）。
         if handler is not None:
             get_client().shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

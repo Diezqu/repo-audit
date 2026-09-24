@@ -21,6 +21,7 @@ from repo_audit.graph import (
 
 
 def _clear_keys(monkeypatch):
+    monkeypatch.setenv("REPO_AUDIT_MODE", "demo")
     for prefix in ("CHEAP", "FLAGSHIP"):
         for k in ("MODEL", "API_KEY", "BASE_URL"):
             monkeypatch.delenv(f"{prefix}_{k}", raising=False)
@@ -186,6 +187,24 @@ def test_unknown_tool_returns_error_for_its_call_id(tmp_path):
     assert len(messages) == 1
     assert messages[0].tool_call_id == "unknown"
     assert "unknown_source" in messages[0].content
+
+
+def test_file_read_os_error_returns_tool_message(tmp_path):
+    class UnreadableTool:
+        def invoke(self, args):
+            raise OSError("file disappeared")
+
+    ai_msg = AIMessage(content="", tool_calls=[
+        {"name": "read_file", "args": {"path": "vanished.py"}, "id": "read"}
+    ])
+    messages = []
+    output, used = graph._handle_tool_calls(
+        ai_msg, {"read_file": UnreadableTool()}, messages, 0
+    )
+    assert output is None
+    assert used == 1
+    assert messages[0].tool_call_id == "read"
+    assert "file disappeared" in messages[0].content
 
 
 def test_later_invalid_submit_does_not_erase_earlier_valid_submit(tmp_path):
@@ -491,3 +510,116 @@ def test_e2e_fake_mode_rejects_fake_references(monkeypatch):
     assert "引用清单" not in result["report"]
     assert "FAKE.md:L1-1" not in result["report"]
     assert "语义未核验" in result["report"]
+
+
+def test_planner_readme_does_not_follow_external_symlink(tmp_path):
+    outside = tmp_path.parent / "private-readme.txt"
+    outside.write_text("SECRET OUTSIDE")
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "README.md").symlink_to(outside)
+    assert "SECRET OUTSIDE" not in graph._readme_head(root)
+
+
+def test_worker_transport_failure_preserves_sibling_results(monkeypatch, tmp_path):
+    import httpx
+
+    class FakeLLM:
+        def with_structured_output(self, schema, *, method):
+            return self
+
+        def bind_tools(self, tools, tool_choice=None):
+            return self
+
+        def invoke(self, value):
+            if isinstance(value, str):
+                return {"subtasks": [
+                    {"target_module": "fail", "questions": ["why"]},
+                    {"target_module": "ok", "questions": ["what"]},
+                ]}
+            if "fail" in value[0].content:
+                raise httpx.ConnectError("secret-token-should-not-leak")
+            return AIMessage(content="", tool_calls=[{
+                "name": "submit_claims",
+                "args": {"claims": [{"statement": "No evidence", "status": "insufficient"}]},
+                "id": "submit",
+            }])
+
+    monkeypatch.setattr(graph.config, "try_flagship_tier", lambda: SimpleNamespace(
+        client=lambda **kwargs: FakeLLM()
+    ))
+    monkeypatch.setattr(graph.config, "try_cheap_tier", lambda: SimpleNamespace(
+        client=lambda **kwargs: FakeLLM()
+    ))
+    result = build_graph().invoke({"question": "q", "repo_root": str(tmp_path)})
+    assert len(result["claims"]) == 2
+    assert {claim.target_module for claim in result["claims"]} == {"fail", "ok"}
+    failed = next(c for c in result["claims"] if c.target_module == "fail")
+    assert failed.status == "insufficient"
+    assert "ConnectError" in failed.statement
+    assert "secret-token-should-not-leak" not in result["report"]
+
+
+def test_worker_programming_error_still_propagates(monkeypatch, tmp_path):
+    class BrokenLLM:
+        def bind_tools(self, tools, tool_choice=None):
+            return self
+
+        def invoke(self, messages):
+            raise TypeError("bug in worker integration")
+
+    monkeypatch.setattr(graph.config, "try_cheap_tier", lambda: SimpleNamespace(
+        client=lambda **kwargs: BrokenLLM()
+    ))
+    task = {"subtask": SubTask(target_module="src", questions=["q"]),
+            "worker_id": "w1", "repo_root": str(tmp_path)}
+    with pytest.raises(TypeError, match="bug in worker integration"):
+        worker(task)
+
+
+def test_cli_missing_config_fails_before_graph_invocation(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("REPO_AUDIT_MODE", "real")
+    for prefix in ("CHEAP", "FLAGSHIP"):
+        for suffix in ("MODEL", "API_KEY", "BASE_URL"):
+            monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
+    monkeypatch.setattr(graph, "build_graph", lambda: pytest.fail("graph must not start"))
+    with pytest.raises(SystemExit) as raised:
+        graph.main([str(tmp_path), "question"])
+    assert raised.value.code != 0
+    assert "Missing env vars" in capsys.readouterr().err
+
+
+def test_cli_demo_runs_with_keys_and_disables_langfuse(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("REPO_AUDIT_MODE", "real")
+    for prefix in ("CHEAP", "FLAGSHIP"):
+        for suffix in ("MODEL", "API_KEY", "BASE_URL"):
+            monkeypatch.setenv(f"{prefix}_{suffix}", "dummy")
+    for suffix in ("PUBLIC_KEY", "SECRET_KEY", "HOST"):
+        monkeypatch.setenv(f"LANGFUSE_{suffix}", "dummy")
+    monkeypatch.setattr(graph.config, "CallbackHandler", lambda: pytest.fail("Langfuse started"))
+    assert graph.main(["--demo", str(tmp_path), "question"]) == 0
+    assert "假数据" in capsys.readouterr().out
+
+
+def test_cli_rejects_blank_question(monkeypatch, tmp_path, capsys):
+    with pytest.raises(SystemExit) as raised:
+        graph.main(["--demo", str(tmp_path), "   "])
+    assert raised.value.code != 0
+    assert "nonblank" in capsys.readouterr().err
+
+
+def test_cli_rejects_missing_root(tmp_path, capsys):
+    with pytest.raises(SystemExit) as raised:
+        graph.main(["--demo", str(tmp_path / "missing"), "q"])
+    assert raised.value.code != 0
+    assert "not a directory" in capsys.readouterr().err
+
+
+def test_worktree_git_metadata_file_is_not_evidence(tmp_path):
+    from repo_audit.repo_tools import grep_repo, repo_stats, repo_tree
+
+    (tmp_path / ".git").write_text("gitdir: SECRET METADATA\n")
+    (tmp_path / "source.py").write_text("print('visible')\n")
+    assert ".git" not in repo_tree(tmp_path)
+    assert repo_stats(tmp_path).total_files == 1
+    assert "SECRET METADATA" not in grep_repo(tmp_path, "SECRET")
